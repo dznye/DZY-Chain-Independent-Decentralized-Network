@@ -1,0 +1,34 @@
+{
+	"functions": {
+		"open": {
+			"args": ["seller", "arbiter"],
+			"body": ["seq",
+				["require", ["not", ["has", "buyer"]], "this escrow is already open"],
+				["require", ["and", ["isaddress", ["arg", "seller"]], ["isaddress", ["arg", "arbiter"]]], "seller and arbiter must be addresses"],
+				["require", [">", ["paid", "DZY"], 0], "send the DZY to hold with this call"],
+				["set", "buyer", ["caller"]],
+				["set", "seller", ["arg", "seller"]],
+				["set", "arbiter", ["arg", "arbiter"]],
+				["set", "amount", ["paid", "DZY"]],
+				["set", "state", "held"]
+			]
+		},
+		"release": {
+			"body": ["seq",
+				["require", ["=", ["get", "state"], "held"], "nothing is held"],
+				["require", ["or", ["=", ["caller"], ["get", "buyer"]], ["=", ["caller"], ["get", "arbiter"]]], "only the buyer or the arbiter can release"],
+				["set", "state", "released"],
+				["transfer", "DZY", ["get", "seller"], ["get", "amount"]]
+			]
+		},
+		"refund": {
+			"body": ["seq",
+				["require", ["=", ["get", "state"], "held"], "nothing is held"],
+				["require", ["or", ["=", ["caller"], ["get", "seller"]], ["=", ["caller"], ["get", "arbiter"]]], "only the seller or the arbiter can refund"],
+				["set", "state", "refunded"],
+				["transfer", "DZY", ["get", "buyer"], ["get", "amount"]]
+			]
+		},
+		"status": { "view": true, "body": ["str", ["get", "state", "empty"], " ", ["get", "amount", 0]] }
+	}
+}

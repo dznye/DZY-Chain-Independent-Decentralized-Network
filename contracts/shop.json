@@ -1,0 +1,34 @@
+{
+	"init": ["seq", ["set", "owner", ["caller"]], ["set", "sold", 0]],
+	"functions": {
+		"open": {
+			"args": ["symbol", "name", "stock", "price"],
+			"body": ["seq",
+				["require", ["=", ["caller"], ["get", "owner"]], "only the owner opens the shop"],
+				["require", ["not", ["has", "item"]], "the shop is already open"],
+				["require", [">", ["arg", "price"], 0], "the price must be above zero"],
+				["set", "item", ["newtoken", ["arg", "symbol"], ["arg", "name"], 0, ["arg", "stock"]]],
+				["set", "price", ["arg", "price"]],
+				["emit", ["str", "open ", ["get", "item"]]]
+			]
+		},
+		"buy": {
+			"body": ["seq",
+				["require", ["has", "item"], "the shop is not open yet"],
+				["require", [">=", ["paid", "DZY"], ["get", "price"]], "send at least the price in DZY"],
+				["mint", ["get", "item"], ["caller"], 1],
+				["set", "sold", ["+", ["get", "sold"], 1]],
+				["emit", ["str", "sold to ", ["caller"]]]
+			]
+		},
+		"collect": {
+			"body": ["seq",
+				["require", ["=", ["caller"], ["get", "owner"]], "only the owner collects"],
+				["require", [">", ["balance", "DZY"], 0], "nothing to collect"],
+				["transfer", "DZY", ["get", "owner"], ["balance", "DZY"]]
+			]
+		},
+		"item": { "view": true, "body": ["get", "item"] },
+		"sold": { "view": true, "body": ["get", "sold"] }
+	}
+}

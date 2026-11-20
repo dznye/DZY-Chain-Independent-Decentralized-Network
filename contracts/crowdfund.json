@@ -1,0 +1,48 @@
+{
+	"init": ["seq", ["set", "creator", ["caller"]], ["set", "total", 0]],
+	"functions": {
+		"setup": {
+			"args": ["goal", "deadline"],
+			"body": ["seq",
+				["require", ["=", ["caller"], ["get", "creator"]], "only the creator sets it up"],
+				["require", ["not", ["has", "goal"]], "already set up"],
+				["require", [">", ["arg", "goal"], 0], "the goal must be above zero"],
+				["require", [">", ["arg", "deadline"], ["now"]], "the deadline must be in the future"],
+				["set", "goal", ["arg", "goal"]],
+				["set", "deadline", ["arg", "deadline"]]
+			]
+		},
+		"give": {
+			"body": ["seq",
+				["require", ["has", "goal"], "not set up yet"],
+				["require", ["<", ["now"], ["get", "deadline"]], "the deadline has passed"],
+				["require", [">", ["paid", "DZY"], 0], "send DZY with this call"],
+				["let", "k", ["str", "p:", ["caller"]]],
+				["set", ["var", "k"], ["+", ["get", ["var", "k"], 0], ["paid", "DZY"]]],
+				["set", "total", ["+", ["get", "total"], ["paid", "DZY"]]]
+			]
+		},
+		"claim": {
+			"body": ["seq",
+				["require", ["=", ["caller"], ["get", "creator"]], "only the creator can claim"],
+				["require", [">=", ["now"], ["get", "deadline"]], "wait for the deadline"],
+				["require", [">=", ["get", "total"], ["get", "goal"]], "the goal was not reached: givers can take their DZY back"],
+				["require", [">", ["balance", "DZY"], 0], "already claimed"],
+				["transfer", "DZY", ["get", "creator"], ["balance", "DZY"]]
+			]
+		},
+		"refund": {
+			"body": ["seq",
+				["require", [">=", ["now"], ["get", "deadline"]], "wait for the deadline"],
+				["require", ["<", ["get", "total"], ["get", "goal"]], "the goal was reached: nothing to refund"],
+				["let", "k", ["str", "p:", ["caller"]]],
+				["let", "mine", ["get", ["var", "k"], 0]],
+				["require", [">", ["var", "mine"], 0], "you gave nothing, or took it back already"],
+				["set", ["var", "k"], 0],
+				["transfer", "DZY", ["caller"], ["var", "mine"]]
+			]
+		},
+		"pledged": { "view": true, "args": ["who"], "body": ["get", ["str", "p:", ["arg", "who"]], 0] },
+		"total": { "view": true, "body": ["get", "total"] }
+	}
+}

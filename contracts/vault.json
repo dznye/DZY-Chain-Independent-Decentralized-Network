@@ -1,0 +1,23 @@
+{
+	"functions": {
+		"lock": {
+			"args": ["until"],
+			"body": ["seq",
+				["require", ["not", ["has", "owner"]], "this vault is already in use"],
+				["require", [">", ["arg", "until"], ["now"]], "the unlock time must be in the future"],
+				["require", [">", ["paid", "DZY"], 0], "send the DZY to lock with this call"],
+				["set", "owner", ["caller"]],
+				["set", "until", ["arg", "until"]]
+			]
+		},
+		"withdraw": {
+			"body": ["seq",
+				["require", ["=", ["caller"], ["get", "owner"]], "only the owner can take it out"],
+				["require", [">=", ["now"], ["get", "until"]], "still locked"],
+				["require", [">", ["balance", "DZY"], 0], "empty"],
+				["transfer", "DZY", ["get", "owner"], ["balance", "DZY"]]
+			]
+		},
+		"unlocks": { "view": true, "body": ["get", "until"] }
+	}
+}

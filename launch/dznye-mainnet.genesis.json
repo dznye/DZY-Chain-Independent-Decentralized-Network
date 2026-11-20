@@ -1,0 +1,25 @@
+{
+	"sun": {
+		"chain": "dznye-mainnet",
+		"time": 1794935106736,
+		"validators": [
+			"6653763632eb15f0e36df4f6710722e95ac555939df956aac01f1cf8f9341ac4"
+		],
+		"sales": [
+			{
+				"to": "6653763632eb15f0e36df4f6710722e95ac555939df956aac01f1cf8f9341ac4",
+				"units": 1000000000,
+				"paid": 1169009,
+				"proof": "fiat: the founding purchase, 8,500 DZY for 1,000 US dollars, paid by the founder for the first validator node, 2026-11-16 (the part locked)",
+				"lockYears": 50
+			},
+			{
+				"to": "6653763632eb15f0e36df4f6710722e95ac555939df956aac01f1cf8f9341ac4",
+				"units": 849000000000,
+				"paid": 998830991,
+				"proof": "fiat: the founding purchase, 8,500 DZY for 1,000 US dollars, paid by the founder for the first validator node, 2026-11-16 (the rest)"
+			}
+		]
+	},
+	"hash": "5b5dab338505f1bdb412f7f8e7b039bd3fa2ce3f9246a6d54aab2a379c705239"
+}

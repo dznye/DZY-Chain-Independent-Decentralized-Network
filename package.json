@@ -1,0 +1,19 @@
+{
+  "name": "dzy-chain-network",
+  "version": "1.0.0",
+  "description": "DZY: a proof-of-stake blockchain node, wallet and client.",
+  "license": "MIT",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "bin": { "dzy": "wallet/dzy.mjs" },
+  "scripts": {
+    "wallet": "node --no-warnings wallet/dzy.mjs",
+    "node": "node --no-warnings node/runner.mjs",
+    "chain": "node --no-warnings node/server.mjs",
+    "cli": "node --no-warnings cli.mjs",
+    "test": "node --no-warnings safe.test.mjs && node --no-warnings transfers.test.mjs && node --no-warnings swap.test.mjs && node --no-warnings exchange.test.mjs && node --no-warnings consensus.test.mjs && node --no-warnings contracts.test.mjs && node --no-warnings node/runner.test.mjs && node --no-warnings vaultwatch.test.mjs"
+  },
+  "keywords": ["blockchain", "proof-of-stake", "bft", "node", "wallet"],
+  "repository": { "type": "git", "url": "https://github.com/dznye/DZY-Chain-Independent-Decentralized-Network" },
+  "homepage": "https://chain.dznye.com"
+}
