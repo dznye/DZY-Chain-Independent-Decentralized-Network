@@ -27,6 +27,9 @@ On first start it creates its own key in the data folder. Once that address hold
 and the node becomes a checker: a few times an hour it records which block it checked, and shares the checkers' part of
 the validators' daily pay on days it was active.
 
+To take part in agreeing blocks instead (a validator: a public address and one seat's stake), see
+[validator.md](validator.md).
+
 ## Options
 
 ```
