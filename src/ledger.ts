@@ -1014,7 +1014,7 @@ const HANDLERS: Record<string, Handler> = {
 	    more than two thirds of the say agree on every detail: the coin is held, the address gets claims on exactly that
 	    much, and DZY at today's rate from the sale. With no agreed price, past a limit, or with the sale over, it gets the
 	    claims only, and may take its coin straight back (it is never stranded). */
-	'x.deposit'(s, from, d, _id, time) {
+	'x.deposit'(s, from, d, _id, time, ctx) {
 		if (!exchangeOn(s)) fail('the exchange is not open on this chain');
 		if (!s.validators.includes(from)) fail('only a validator confirms a deposit');
 		const coin = typeof d.coin === 'string' && xLive(s, d.coin) ? d.coin : fail('no such coin on the exchange');
@@ -1034,7 +1034,7 @@ const HANDLERS: Record<string, Handler> = {
 			x.vaults[held] = (x.vaults[held] ?? 0) + amount;
 			const price = xPrice(s, coin, time), usd = price === null ? 0n : (B(amount) * B(price)) / 10n ** B(X_COINS[coin].decimals);
 			const parked = !!x.park && own(x.park, to);
-			const units = parked || price === null || amount > lim.deposit || vaultTotal + amount > lim.vault || u.salePot <= 0 ? 0 : N(saleUnitsFor(V2, B(u.sold), usd));
+			const capped = !xUnlimited(s, ctx.height), units = parked || price === null || (capped && (amount > lim.deposit || vaultTotal + amount > lim.vault)) || u.salePot <= 0 ? 0 : N(saleUnitsFor(V2, B(u.sold), usd));
 			const given = units > 0 && units <= u.salePot ? units : 0;
 			if (given) { u.salePot -= given; u.sold += given; add(s, to, NATIVE, given); (x.locks ??= {})[`${to}:${coin}`] = (x.locks[`${to}:${coin}`] ?? 0) + amount; } // locked in the buyer's own name
 			else { claimAsset(s, coin).supply += amount; claimAsset(s, coin).minted += amount; add(s, to, 'x' + coin, amount); } // free coin, theirs: to trade or take straight back
@@ -2727,6 +2727,15 @@ export const X_LIMITS: Readonly<Record<string, { deposit: number; vault: number 
 	USDT: { deposit: 1_000_000_000, vault: 10_000_000_000 }, BNB: { deposit: 3_000_000_000, vault: 30_000_000_000 },
 	POL: { deposit: 5_000_000_000_000, vault: 50_000_000_000_000 }, AVAX: { deposit: 50_000_000_000, vault: 500_000_000_000 },
 });
+/* the starting limits lifted (2026-11-21, the owner's choice): from this block on mainnet a deposit is never held back for
+   its size or for how full the vault is; every block before it replays under the limits as they were, so a node that has
+   not updated agrees with every block until it. Other chains keep the limits. What stays: the sale's own end (3,000,000
+   DZY), the need for an agreed coin price, and "park". */
+const X_UNLIMITED_FROM: Record<string, number> = { 'dznye-mainnet': 6_900 }; // live height 6,769 when deployed, 21 Nov 2026
+const TEST_X_UNLIMITED = new Map<string, number>();
+/** TEST ONLY: the block a test chain lifts the limits from (null: back to the rule) */
+export function testXUnlimitedFrom(chain: string, height: number | null) { if (height === null) TEST_X_UNLIMITED.delete(chain); else TEST_X_UNLIMITED.set(chain, height); }
+export const xUnlimited = (s: State, height: number = s.height + 1) => height >= (TEST_X_UNLIMITED.get(s.chain) ?? (Object.hasOwn(X_UNLIMITED_FROM, s.chain) ? X_UNLIMITED_FROM[s.chain] : Infinity));
 export const X_ADDRESS: Readonly<Record<string, RegExp>> = Object.freeze({ btc: /^(bc1[02-9ac-hj-np-z]{11,71}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$/, evm: /^0x[0-9a-fA-F]{40}$/, sol: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/ });
 /** a price counts only when validators with more than two thirds of the say read it within the last hour and agree
     within 2%: then the middle reading. Otherwise there is none, and trades wait. */
@@ -2836,7 +2845,7 @@ export function exchangeView(s: State) {
 		const k = { ...k0, nets: k0.nets.filter((n) => xLive(s, c, n)) }; // only what counts now
 		const held = Object.fromEntries(k.nets.map((n) => [n, s.x?.vaults[`${n}:${c}`] ?? 0])), total = Object.values(held).reduce((a, b) => a + b, 0);
 		const claims = s.assets['x' + c]?.supply ?? 0, locked = Object.entries(s.x?.locks ?? {}).filter(([q]) => q.endsWith(':' + c)).reduce((n, [, v]) => n + v, 0);
-		return [c, { name: k.name, decimals: k.decimals, nets: k.nets, vaults: Object.fromEntries(k.nets.filter((n) => own(vaults, n)).map((n) => [n, vaults[n]])), held, total, claims, locked, pot: s.x?.pot?.[c] ?? 0, price: xPrice(s, c), limits: X_LIMITS[c] }];
+		return [c, { name: k.name, decimals: k.decimals, nets: k.nets, vaults: Object.fromEntries(k.nets.filter((n) => own(vaults, n)).map((n) => [n, vaults[n]])), held, total, claims, locked, pot: s.x?.pot?.[c] ?? 0, price: xPrice(s, c), limits: xUnlimited(s) ? {} : X_LIMITS[c] }];
 	}));
 	const f = xFloor(s), btc = xPrice(s, 'BTC');
 	const floor = f ? { usd: f.perDzy, sats: btc ? N((B(f.perDzy) * 100_000_000n) / B(btc)) : null } : null;

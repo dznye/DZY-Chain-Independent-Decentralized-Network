@@ -227,6 +227,40 @@ await test('Limits: a deposit over the limit, or after the sale has nothing left
 	solvent(s, 'limits'); whole(s, 'limits');
 });
 
+await test('Limits lifted (block-gated): before the block an over-limit deposit is free coin; from it on the same deposit buys DZY and a lock, which can be undone', async () => {
+	const s = await open();
+	await prices(s, { BTC: 90_000_000_000 });
+	const lift = s.height + 12;
+	L.testXUnlimitedFrom(CHAIN, lift);
+	try {
+		assert.equal(L.exchangeView(s).coins.BTC.limits.deposit, L.X_LIMITS.BTC.deposit, 'limits shown before the lift');
+		const a0 = bal(s, A), over = L.X_LIMITS.BTC.vault + 1; // past the deposit limit AND the vault limit
+		await deposit(s, { net: 'btc', coin: 'BTC', amount: over, tx: payment(), to: A.address });
+		assert.equal(bal(s, A), a0, 'DZY given before the lift');
+		assert.equal(bal(s, A, 'xBTC'), over, 'kept as free coin before the lift');
+		while (s.height + 1 < lift) await send(s, VS[0], 'x.price', { p: { BTC: 90_000_000_000 } });
+		assert.deepEqual(L.exchangeView(s).coins.BTC.limits, {}, 'limits shown after the lift');
+		const owned = bal(s, A, 'xBTC');
+		await deposit(s, { net: 'btc', coin: 'BTC', amount: over, tx: payment(), to: A.address });
+		assert.ok(bal(s, A) > a0, 'DZY given after the lift');
+		assert.equal(lock(s, A, 'BTC'), over, 'locked in the buyer\'s own name after the lift');
+		assert.equal(bal(s, A, 'xBTC'), owned, 'no extra free coin after the lift');
+		solvent(s, 'lift'); whole(s, 'lift');
+		await send(s, A, 'x.close', { coin: 'BTC', to: 'wallet' });
+		assert.equal(lock(s, A, 'BTC'), 0, 'the lock closes');
+		assert.ok(bal(s, A, 'xBTC') > owned, 'the coin comes back as free coin');
+		solvent(s, 'lift undone'); whole(s, 'lift undone');
+		return `deposit limit ${L.X_LIMITS.BTC.deposit}, vault limit ${L.X_LIMITS.BTC.vault}: both gone from block ${lift}`;
+	} finally { L.testXUnlimitedFrom(CHAIN, null); }
+});
+
+await test('The lift is only for a chain that names it: with no block set (and on mainnet until its block) the limits hold', async () => {
+	const s = await open();
+	assert.equal(L.xUnlimited(s), false, 'a chain with no lift block');
+	const m = await L.sunGenesis({ chain: 'dznye-mainnet', time: T0, validators: VS.map((v) => v.address), seedWait: 0, sales: [{ to: A.address, units: dzy(10), paid: dzy(10) / 500, proof: 'test' }] });
+	assert.equal(L.xUnlimited(m, 1), false, 'mainnet before its block');
+});
+
 await test('Attacks: draining a vault through a network that holds less, paying to a bad address, taking out locked coin as free, anyone but a validator posting prices', async () => {
 	const s = await open();
 	await prices(s, { ETH: 3_000_000_000 });
