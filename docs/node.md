@@ -24,10 +24,10 @@ node node/runner.mjs --status            # print the node's address and state, t
 ```
 
 On first start it creates its own key in the data folder. Once that address holds 1 DZY or more, the runner stakes it
-and the node becomes a checker: a few times an hour it records which block it checked, and shares the checkers' part of
-the validators' daily pay on days it was active.
+and the node becomes a checker (a Guardian): a few times an hour it records which block it checked, for free, and on
+days it was active it shares the Guardians' 5% of every fee, by stake x time.
 
-To also make blocks (a validator: the same 1 DZY staked, plus a public address), see
+To also make blocks (a validator: a place staked, 69 DZY at first, plus a public address), see
 [validator.md](validator.md).
 
 ## Options

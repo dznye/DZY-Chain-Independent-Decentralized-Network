@@ -23,6 +23,14 @@ export function saleCost(cfg, a, b) { // µ$ to buy units a..b, rounded up: the 
 export function salePrice(cfg, s) { // µ$ per DZY at s units sold
 	return cfg.saleStart * (1n << (s / cfg.saleDouble)) * expS((s % cfg.saleDouble) * LN2 / cfg.saleDouble) / S;
 }
+/** The other way: the fewest units whose stretch of the curve, from `sold` down, is worth `want` µ$ (all of it, when all of
+    it is worth less). Buying and giving back walk the same area, so a round trip can never leave anything over. */
+export function saleBackFor(cfg, sold, want) {
+	if (saleCost(cfg, 0n, sold) <= want) return sold;
+	let lo = 0n, hi = sold;
+	while (lo < hi) { const m = (lo + hi) / 2n; if (saleCost(cfg, sold - m, sold) >= want) hi = m; else lo = m + 1n; }
+	return lo;
+}
 export function saleUnitsFor(cfg, sold, paid) { // the most units whose cost fits in what was paid, never past the cap
 	let lo = sold, hi = cfg.saleCap;
 	if (saleCost(cfg, sold, hi) <= paid) return hi - sold;

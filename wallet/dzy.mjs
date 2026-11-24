@@ -31,16 +31,18 @@ const HELP = `dzy: the DZY wallet
   dzy price                    DZY's price, and how much DZY one ETH, SOL, USDC or BTC buys
   dzy buy <amount> <coin> [--on <chain>]      pay into the vault, get DZY: ETH, USDC, USDT, BNB, POL, AVAX or SOL
                                chains: arb, base, op, bsc, polygon, avax, eth (or sol for SOL)
-  dzy send <@name|address> <amount> [asset]     send DZY (or another coin held on Dznye)
+  dzy send <@name|address> <amount> [asset] [--fast|--slow]   send DZY (or another coin held on Dznye); --fast tips to
+                               go first while blocks are full, --slow waits for a quiet block
   dzy swap <amount> <from> <to>                 swap on the Dznye market, e.g.  dzy swap 0.005 ETH DZY
   dzy name <name>              take a name (6+ characters, free with the starter credit)
-  dzy node [--payout @name]    run a node on this computer: it checks the chain and earns while it is on
+  dzy grants [vote <id> yes|no]  the contributors' fund (a tenth of every fee) and its proposals; vote with stake
+  dzy node [--payout @name]   run a node on this computer: it checks the chain and earns while it is on
   dzy backup                   where your backup file is (keep a copy somewhere else, with your PIN written down)
 
   --yes skips "are you sure". DZY_PIN, DZY_HOME, DZY_API (default https://api.dznye.com) are read from the environment.`;
 
 const DZY = 100_000_000;
-const args = process.argv.slice(2), words = args.filter((a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1].startsWith('--') && !['--yes'].includes(args[i - 1])));
+const args = process.argv.slice(2), words = args.filter((a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1].startsWith('--') && !['--yes', '--fast', '--slow'].includes(args[i - 1])));
 const flag = (n, d) => { const i = args.indexOf('--' + n); return i >= 0 ? (args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : true) : d; };
 const HOME = process.env.DZY_HOME ?? join(homedir(), '.dzy'), SAFE = join(HOME, 'wallet.json'), PUB = join(HOME, 'addresses.json');
 const api = new Client(process.env.DZY_API ?? 'https://api.dznye.com');
@@ -234,10 +236,15 @@ const C = {
 		const to = words[1] ?? stop('To whom? `dzy send @name 1.5`'), amountText = words[2] ?? stop('How much?'), asset = words[3] ?? 'DZY';
 		const addr = to.startsWith('@') ? (await api.whoIs(to)) ?? stop(`No one is called ${to}.`) : /^[0-9a-f]{64}$/.test(to) ? to : stop('Send to @name or a DZY address (64 letters and digits).');
 		const dec = asset === 'DZY' ? 8 : ['xUSDC', 'xUSDT'].includes(asset) ? 6 : asset === 'xBTC' ? 8 : 9, amount = toParts(amountText, dec) ?? stop('That is not an amount.');
+		// the price in the chain's own words (POST /explain), and how fast (GET /fees): --fast tips, --slow sets a most
+		const data = { asset, to: addr, amount }, speed = flag('fast') ? 'fast' : flag('slow') ? 'slow' : 'normal';
+		const [said, fees] = await Promise.all([fetch(api.url + '/explain', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ from: pub().dznye, type: 'transfer', data }) }).then((r) => (r.ok ? r.json() : null)).catch(() => null), speed === 'normal' ? null : api.get('/fees').catch(() => null)]);
+		const fare = !fees ? {} : speed === 'slow' ? (fees.slow?.max ? { max: fees.slow.max } : {}) : fees.fast?.tip ? { tip: fees.fast.tip } : {};
+		if (said?.cost) out(`${said.cost}${fare.tip ? `, plus a tip of ${dzyText(fare.tip)} DZY to go first` : ''}${fare.max ? ' (waits for a quiet block)' : ''}.`);
 		if (!(await sure(`Send ${amountText} ${asset} to ${to}${to.startsWith('@') ? ` (${addr.slice(0, 8)}…)` : ''}?`))) stop('Nothing sent.');
 		const k = await keys();
-		await api.send(k.dz, 'transfer', { asset, to: addr, amount });
-		out('Sent.');
+		await api.send(k.dz, 'transfer', data, !fare.max, fare);
+		out(fare.max ? 'Sent: it goes in the next quiet block.' : 'Sent.');
 	},
 	async swap() {
 		const DEC = { DZY: 8, xBTC: 8, xUSDC: 6, xUSDT: 6 }, amountText = words[1] ?? stop('e.g. `dzy swap 0.005 ETH DZY`'), id = (s) => { const u = String(s ?? '').toUpperCase(); return u === 'DZY' ? 'DZY' : ['ETH', 'SOL', 'USDC', 'USDT', 'BTC', 'BNB', 'POL', 'AVAX'].includes(u) ? 'x' + u : stop(`What is ${s}?`); };
@@ -260,6 +267,22 @@ const C = {
 		await api.send(k.dz, 'credit.take', {}).catch(() => { /* already taken, or not needed */ });
 		await api.send(k.dz, 'name.set', { name: n });
 		out(`You are @${n}. People can pay you by that name.`);
+	},
+	async grants() {
+		const h = await api.get('/heart'), amt = (p) => (p.asset === 'DZY' ? dzyText(p.amount) : p.amount + ' units of') + ' ' + p.asset;
+		if (!h.on) stop('This chain has no contributors\' fund yet.');
+		if (words[1] === 'vote') {
+			const id = words[2] ?? stop('`dzy grants vote <id> yes|no`'), yes = /^y(es)?$/i.test(words[3] ?? '') ? true : /^no?$/i.test(words[3] ?? '') ? false : stop('Say yes or no.');
+			const p = h.props?.[id] ?? stop(`No open proposal ${id}. \`dzy grants\` lists them.`);
+			if (!await sure(`Vote ${yes ? 'yes' : 'no'} on paying ${amt(p)} to ${p.to.slice(0, 8)}… (“${p.reason}”)?`)) stop('Nothing sent.');
+			await api.send((await keys()).dz, 'grant.vote', { id, yes });
+			return out('Voted. It is paid the moment more than two thirds of all stake says yes.');
+		}
+		out(`In the fund: ${dzyText(h.grants ?? 0)} DZY${Object.entries(h.coin?.g ?? {}).filter(([, n]) => n > 0).map(([c, n]) => `, ${n} units of ${c}`).join('')}`);
+		const props = Object.entries(h.props ?? {});
+		if (!props.length) return out('No proposals open. Propose one in the web wallet: Me > Earn & sell > Contributors\' fund.');
+		for (const [id, p] of props) { const v = Object.values(p.votes ?? {}); out(`\n${id}  ${amt(p)} to ${p.to}\n   “${p.reason}”  ${v.filter(Boolean).length} yes, ${v.filter((x) => !x).length} no, ends ${new Date(p.until).toISOString().slice(0, 16).replace('T', ' ')} UTC`); }
+		out('\nVote (with DZY staked or backing a validator): dzy grants vote <id> yes');
 	},
 	async node() { process.argv.splice(2, 1); await import('../node/runner.mjs'); },
 	backup() { pub(); out(`Your backup file: ${SAFE}\nKeep a copy somewhere else (a USB stick, your cloud), and your PIN written down apart from it.\nIt opens in the web wallet too: wallet.dznye.com, Restore from backup.`); },

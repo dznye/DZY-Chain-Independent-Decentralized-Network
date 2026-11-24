@@ -1,21 +1,33 @@
 # Running a validator
 
-Anyone can help run the chain with **1 DZY staked**. What the node does depends on whether other computers can reach it:
+Anyone can help run the chain. Checking needs **1 DZY staked**; making blocks needs **a place**, staked (69 DZY at
+first: `GET /heart` gives `nextPlace`). What the node does depends on whether other computers can reach it:
 
-| | Checker | Validator |
+| | Checker (Guardian) | Validator |
 |---|---|---|
-| What it does | Copies and checks every block, and records a few times an hour which block it checked | The same, and it is in the draw to make blocks: every 10 minutes a crew is drawn from the validators online |
-| Stake | 1 DZY or more | 1 DZY or more |
+| What it does | Copies and checks every block, and records a few times an hour which block it checked (free) | The same, and it is in the raffle for every block |
+| Stake | 1 DZY or more | A place: 69 DZY at first, doubling at every 25 validators (`nextPlace`) |
 | Needs a public address | No | Yes: other validators must reach it (`PUBLIC_URL`) |
-| Pay | On days it was seen in 12 different hours, the checkers share 20% of the day's work pay, by stake | Paid for the blocks it makes, plus a daily bonus drawn by stake |
+| Pay | On days it was seen in 12 different hours and made fewer blocks than its share: 5% of every fee, shared by stake x time | 40% of every fee, by the blocks it made (shared with its backers after its commission) |
 | How | `node node/runner.mjs --payout <address>` (see [node.md](node.md)) | This page |
 
-**Stake and chances.** The crew is drawn with one ticket per staked shard (the node's own stake plus what others back
-it with): more stake, picked more often. While 64 or fewer validators are online, every one of them is in the crew.
-Splitting one stake over several keys gains nothing.
+**Power is stake x time (the Heart and time rules, live since blocks 8,760 and 8,820).** 1 DZY behind a validator (its
+own plus what others back it with) for 1 second online is 1 raffle shard, up to four years. Added stake starts its own
+clock. After an hour away, every second away takes 4 off; a missed turn costs a day (at most half), and 3 missed in a row
+bench it. Who makes each block, and who steps in, is drawn by raffle shards, seeded by Bitcoin. Splitting one stake over
+several keys gains nothing.
 
-(`GET /validators` also reports `minStake` and `seatPrice`: those are the rule from before the crew draw, kept for older
-chains. On the Dznye chain, 1 DZY staked is enough.)
+**Proven and the starting validators.** A validator with 69 DZY and 30 days online is proven. Until 4 proven others with
+250,000 DZY between them are online, the starting validators carry the chain, and everyone else together holds at most a
+quarter of the say (then their share of 250,000 DZY, then all of it).
+
+**Cheating.** Two blocks signed at one place, which anyone can prove: the whole stake and the seat for good; the prover
+gets a part, the rest is a bonus for the honest. Confirming a payment from another chain that a guardian objected to and
+a starting validator threw out: the seat for 30 days, all raffle shards and a tenth of the stake.
+
+`GET /heart` shows every validator's stake, time online, raffle shards, whether it is proven, and its chance at the next
+block. (`GET /validators` also reports `minStake` and `seatPrice`: the rule from before the Heart upgrade, kept for
+older chains.)
 
 ## Before you start
 
@@ -23,7 +35,7 @@ chains. On the Dznye chain, 1 DZY staked is enough.)
 - **A public HTTPS address** for the node: a server with a domain, or a home computer behind a tunnel (for example
   Cloudflare Tunnel) or with port 8787 forwarded to it.
 - **Node.js 24 or newer.** Nothing else to install.
-- **1 DZY or more** for the stake, plus a little for fees.
+- **The price of a place** for the stake (69 DZY or more: `nextPlace` at `GET /heart`), plus a little for fees.
 
 ## Steps
 
@@ -52,13 +64,13 @@ chains. On the Dznye chain, 1 DZY staked is enough.)
 
    It copies the chain from the peers first; wait until it reports the newest block.
 
-5. Fund and stake. Send 1 DZY or more (plus a little for fees) to the validator's address, then:
+5. Fund and stake. Send the price of a place (plus a little for fees) to the validator's address, then:
 
    ```
    node cli.mjs stake bond --key validator.json --amount <DZY>
    ```
 
-   From then on the node checks in with its public address and is in the draw. Unstaking takes `unbondDays` (at
+   From then on the node checks in with its public address and its raffle shards start counting. Unstaking takes `unbondDays` (at
    `GET /validators`).
 
 6. Keep it running. On Linux, run it as a service (systemd: `Restart=always`). On Windows, a scheduled task at
@@ -68,7 +80,8 @@ chains. On the Dznye chain, 1 DZY staked is enough.)
 
 ```
 curl https://api.dznye.com/nodes             # this node's check-ins (its address, hours seen today)
-curl https://api.dznye.com/validators        # the current crew and its power
+curl https://api.dznye.com/heart             # every validator's power, raffle shards and chance
+curl https://api.dznye.com/validators        # stakes and the current crew
 curl http://localhost:8787/                  # this node's height
 ```
 

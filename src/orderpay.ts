@@ -7,6 +7,7 @@ import { EVM } from './evm.ts';
 import { evmTokenOf, ZERO_TOKEN } from './xtokens.ts';
 import { SOL_TOKENS, SOLANA_TX_VERSION } from './solana.ts';
 import type { Order } from './ledger.ts';
+import { checkBtcPayment } from './btc.ts';
 
 type Rpc = (method: string, params: unknown[]) => Promise<any>;
 const TRANSFER_EVENT = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
@@ -16,7 +17,9 @@ export const ORDER_SLACK_MS = 10 * 60 * 1000;
 
 /** what this transaction paid the order's creator, in the coin's Dznye units, or null (not final, failed, too old, not
     a payment in that coin to them) */
-export async function orderReceived(rpc: Rpc, o: Pick<Order, 'net' | 'coin' | 'payTo' | 'at'>, tx: string): Promise<number | null> {
+export async function orderReceived(rpc: Rpc, o: Pick<Order, 'net' | 'coin' | 'payTo' | 'at'> & { due?: number }, tx: string): Promise<number | null> {
+	// Bitcoin: the exact amount asked (its unique satoshis bind it to this checkout), with its proof of work and inclusion
+	if (o.net === 'btc') return o.coin === 'BTC' && o.due ? ((await checkBtcPayment(rpc, { payTo: o.payTo, token: 'BTC', amount: o.due, memo: '' }, tx).catch(() => null)) ? o.due : null) : null;
 	return o.net === 'sol' ? solReceived(rpc, o, tx) : evmReceived(rpc, o, tx);
 }
 async function evmReceived(rpc: Rpc, o: Pick<Order, 'net' | 'coin' | 'payTo' | 'at'>, hash: string): Promise<number | null> {

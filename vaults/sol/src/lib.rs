@@ -145,6 +145,20 @@ fn token_transfer_ix(from: &Pubkey, to: &Pubkey, authority: &Pubkey, amount: u64
 
 fn hex(b: &[u8]) -> String { b.iter().map(|x| format!("{:02x}", x)).collect() }
 
+/// make a program-derived account of `space` bytes, owned by this program. Someone may have sent SOL to its address first
+/// (anyone can): then it is topped up to rent, given its space and taken over, so a few lamports can never block it.
+fn make_pda<'a>(program: &Pubkey, payer: &AccountInfo<'a>, acct: &AccountInfo<'a>, sys: &AccountInfo<'a>, space: usize, seeds: &[&[u8]]) -> ProgramResult {
+	let rent = Rent::get()?.minimum_balance(space);
+	if acct.lamports() == 0 {
+		return invoke_signed(&system_instruction::create_account(payer.key, acct.key, rent, space as u64, program), &[payer.clone(), acct.clone(), sys.clone()], &[seeds]);
+	}
+	if *acct.owner != system_program::ID || !acct.data_is_empty() { return Err(fail("that account is taken")); }
+	let need = rent.saturating_sub(acct.lamports());
+	if need > 0 { invoke(&system_instruction::transfer(payer.key, acct.key, need), &[payer.clone(), acct.clone(), sys.clone()])?; }
+	if space > 0 { invoke_signed(&system_instruction::allocate(acct.key, space as u64), &[acct.clone(), sys.clone()], &[seeds])?; }
+	invoke_signed(&system_instruction::assign(acct.key, program), &[acct.clone(), sys.clone()], &[seeds])
+}
+
 pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> ProgramResult {
 	let (tag, d) = data.split_first().ok_or_else(|| fail("empty instruction"))?;
 	let a = &mut accounts.iter();
@@ -154,10 +168,9 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
 			let payer = next_account_info(a)?; let config = next_account_info(a)?; let sys = next_account_info(a)?;
 			let (key, bump) = pda(&[b"config"], program);
 			if *config.key != key || !payer.is_signer || *sys.key != system_program::ID { return Err(fail("bad accounts")); }
-			if config.lamports() > 0 { return Err(fail("already set up")); }
+			if config.owner == program { return Err(fail("already set up")); }
 			let set = parse_set(d, 1)?;
-			let rent = Rent::get()?.minimum_balance(CONFIG_SIZE);
-			invoke_signed(&system_instruction::create_account(payer.key, config.key, rent, CONFIG_SIZE as u64, program), &[payer.clone(), config.clone(), sys.clone()], &[&[b"config", &[bump]]])?;
+			make_pda(program, payer, config, sys, CONFIG_SIZE, &[b"config", &[bump]])?;
 			set.write(&mut config.try_borrow_mut_data()?);
 			msg!("dznye-set 1");
 			Ok(())
@@ -199,12 +212,11 @@ pub fn process(program: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Progr
 			if *vault.key != vault_key { return Err(fail("not this vault")); }
 			let (rel_key, rel_bump) = pda(&[b"released", &id], program);
 			if *released.key != rel_key { return Err(fail("not this payout's mark")); }
-			if released.lamports() > 0 { return Err(fail("already released")); }
+			if released.owner == program { return Err(fail("already released")); }
 			let set = Set::read(&config.try_borrow_data()?)?;
 			check_signed(&set, &release_message(program, set.id, &id, &mint, &to, amount), sysvar)?;
 			// mark it paid first: the account exists from now on
-			let rent = Rent::get()?.minimum_balance(0);
-			invoke_signed(&system_instruction::create_account(payer.key, released.key, rent, 0, program), &[payer.clone(), released.clone(), sys.clone()], &[&[b"released", &id, &[rel_bump]]])?;
+			make_pda(program, payer, released, sys, 0, &[b"released", &id, &[rel_bump]])?;
 			if mint == [0u8; 32] {
 				if dest.key.to_bytes() != to { return Err(fail("not the payee")); }
 				invoke_signed(&system_instruction::transfer(vault.key, dest.key, amount), &[vault.clone(), dest.clone(), sys.clone()], &[&[b"vault", &[vault_bump]]])?;

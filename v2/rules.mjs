@@ -29,7 +29,7 @@ export const RULES = {
 	maxTickets: 60n,              // ... but never more than 60, so the chain's work is the same at any size
 	answerMinutes: 10n,           // a winner has this long, once the winners are known, to answer its history question
 	seedWait: 60n,                // with no new Bitcoin block for this long, a round is drawn from the chain's own last block
-	minYears: 1n, maxYears: 100n, // lock weight = DZY locked x whole years: as long as someone wants, up to 100 (2026-11-16, the owner's choice)
+	minYears: 1n, maxYears: 100n, // lock weight = DZY locked x whole years: as long as someone wants, up to 100 (2026-11-16)
 	/* the fixed deposit: weight = the parts of the balance that have waited 30 days, a year, 3 years (0 to 3 x balance) */
 	tiers: [30n * DAY, YEAR, 3n * YEAR],
 	renewMinutes: YEAR,           // an account that signs nothing for this long stops earning (lost keys)
@@ -68,7 +68,7 @@ export const RULES = {
 	   everyday fees, on credit. Repaid from the first DZY it receives, with the policy rate as interest, or after about
 	   6 months taken back: the name released, the account never given credit again. It can never be sent as DZY */
 	creditAmount: 22n * UNIT / 10n, // 2.2 DZY: a name (0.1), a token (1), a contract (1) and fees
-	creditMinutes: YEAR / 2n,     // repay within half a year (about 6 months, the owner's choice), or it is taken back
+	creditMinutes: YEAR / 2n,     // repay within half a year (about 6 months), or it is taken back
 	creditBp: 50n,                // the fees paid on credit: at most 0.5% of the Sun a year, at most a day of it saved up
 	creditPerDay: 1_000n,         // new starter credits a chain day, at most
 	/* free transactions for lockers (like staking for bandwidth on Tron): every chain day, freePerDay simple transactions

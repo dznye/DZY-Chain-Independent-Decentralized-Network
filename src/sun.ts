@@ -3,7 +3,8 @@ import { canon, isAddrHex, sha256 } from './crypto.ts';
 import { BP, DAY, DECIMALS, IDX, RULES as R, SUB, SUPPLY as SUPPLY_B, TICK, YEAR, bufferFor, feeNext, moneyGrowthBp, nextFloor, nextRate, policyTarget, seatWeight, ticketsFor, useGapBp, wageSub } from '../v2/rules.mjs';
 // @ts-ignore
 import { saleCost, salePrice, saleUnitsFor } from '../v2/sale.mjs';
-import { crewOn, exchangeOn, powers, RULES as LEDGER, weightOf, type State } from './ledger.ts';
+import { creditCoin, crewOn, exchangeOn, powers, RULES as LEDGER, weightOf, type State } from './ledger.ts';
+import { dayOf, feeFloor, fullness, heartHeld, leastWorking, mayVouch, vouched, payMakers, priceMinute, share, sizeAfter, splitCarry, spotPrice, stakeTime } from './heart.ts';
 import { keysOf, peek } from './layer.ts';
 import { checkHeader } from './btc.ts';
 
@@ -168,6 +169,15 @@ function bench(s: State, a: string) {
 export function seatNow(s: State, amt: number, years: number) {
 	return N(seatWeight(B(amt), B(years), B(SUN_SUPPLY - sunBal(s) - sunOf(s).salePot), B(sunHeld(s).locked)));
 }
+/** A lock becomes validator stake (ledger.ts lock.stake): out of the lockers' share, its unlock unscheduled. Its DZY stay held to the
+    same minute, now as stake: answerable for cheating, never back sooner than the lock promised. Returns what it was. */
+export function lockOut(s: State, a: string, id: string): { amt: number; end: number } {
+	const u = sunOf(s), x = lk(s, a), i = x.list.findIndex((l) => l.id === id), l = x.list[i];
+	setWeight(s, a, -l.w); x.list.splice(i, 1); u.L -= l.amt;
+	const k = String(l.end), evs = u.events[k]; if (evs) { const rest = evs.filter((e) => !(e.k === 'unlock' && e.a === a && e.id === id)); if (rest.length) u.events[k] = rest; else delete u.events[k]; }
+	return { amt: l.amt, end: l.end };
+}
+export const lockOf = (s: State, a: string, id: unknown) => (s.sun && own(sunOf(s).locks, a) && typeof id === 'string' ? sunOf(s).locks[a].list.find((l) => l.id === id) ?? null : null);
 function addLock(s: State, a: string, id: string, amt: number, years: number, w: number) {
 	spend(s, a, amt);
 	const end = sunOf(s).minute + years * N(YEAR);
@@ -228,14 +238,16 @@ export async function sunGenesis(g: SunGenesis): Promise<State> {
 function welcomePays(s: State, a: string, fee: number) {
 	const u = sunOf(s);
 	const holds = balOf(s, a) + lockedOf(s, a); // an empty account is never helped this way: free transactions for new keys would be free spam
+	if (s.x?.index) return false; // the index: the Sun pays nobody's fees any more (they would be DZY with nothing behind them)
 	return fee > 0 && holds > 0 && holds < N(R.welcomeTinyFees) * fee && u.welcome.budget >= fee && sunBal(s) >= fee;
 }
 /** would starter credit pay this account's fee now? (it took credit, cannot pay itself, has credit left, within the budget) */
 function creditPays(s: State, a: string, fee: number) {
 	return fee > 0 && balOf(s, a) < fee && creditCovers(s, a, fee) && sunOf(s).credit.budget >= fee && sunBal(s) >= fee;
 }
-/** would the Sun pay this account's fee now: the welcome budget for a tiny account, or its starter credit */
-export function sunPays(s: State, a: string, fee: number) { return welcomePays(s, a, fee) || creditPays(s, a, fee); }
+/** would the Sun pay this account's fee now: the welcome budget for a tiny account, or its starter credit
+    (`lasting`: it adds entries every node must hold for good: the welcome budget never pays for those, or it would be free flooding) */
+export function sunPays(s: State, a: string, fee: number, lasting = false) { return (!lasting && welcomePays(s, a, fee)) || creditPays(s, a, fee); }
 
 /* ---------- free transactions for lockers (rules.mjs: freePerDay) ---------- */
 /** how many free simple transactions this account has left today: its share of freePerDay by the DZY it has locked */
@@ -284,9 +296,9 @@ function creditDue(s: State, a: string) {
 }
 /** a signed transaction from `from`, whose fee is `fee` paid by `payer` (the Sun, when `bySun`): the sender's deposit
     renews, the fee is taken, and it waits in the profit pot. Runs after every check has passed. */
-export function charge(s: State, from: string, payer: string, fee: number, bySun: boolean) {
+export function charge(s: State, from: string, payer: string, fee: number, bySun: boolean, lasting = false) {
 	const u = sunOf(s);
-	if (bySun && welcomePays(s, payer, fee)) { u.welcome.budget -= fee; setSun(s, sunBal(s) - fee); touch(s, from); }
+	if (bySun && !lasting && welcomePays(s, payer, fee)) { u.welcome.budget -= fee; setSun(s, sunBal(s) - fee); touch(s, from); }
 	else if (bySun) { u.credit.budget -= fee; setSun(s, sunBal(s) - fee); creditUse(s, payer, fee); touch(s, from); } // starter credit
 	else { touch(s, from); if (fee) payFee(s, payer, fee); }
 	u.feePot += fee;
@@ -385,7 +397,7 @@ export const SUN_HANDLERS: Record<string, Handler> = {
 	'sun.attest'(s, from, d, _id, time) {
 		needSun(s);
 		if (exchangeOn(s)) fail('nothing is burned any more: DZY is bought through the exchange, where the coin is held in a vault (EXCHANGE.md)');
-		if (!s.validators.includes(from)) fail('only a validator can confirm a payment');
+		if (!mayVouch(s, from)) fail('only a validator can confirm a payment');
 		const why = sunBuyProblem(d); if (why) fail(why);
 		const u = sunOf(s), p = d as unknown as { net: string; token: string; amount: number; tx: string; to: string };
 		if (u.salePot <= 0) fail('the sale has ended: all 3,000,000 DZY are sold, and burned dollars cannot be given back');
@@ -396,7 +408,7 @@ export const SUN_HANDLERS: Record<string, Handler> = {
 		if (!c && Object.values(u.claims).filter((x) => x.votes.includes(from)).length >= MAX_PENDING) fail(`this validator already has ${MAX_PENDING} confirmations waiting`);
 		const votes = [...(c?.votes ?? []), from], w = powers(s);
 		const said = votes.reduce((n, v) => n + (w[v] ?? 0), 0), all = Object.values(w).reduce((n, v) => n + v, 0);
-		if (said * 3 <= all * 2) return () => { u.claims[key] = c ? { ...c, votes } : { by: p.to, net: p.net, token: p.token, amount: p.amount, tx: p.tx, at: time, votes }; }; // not enough of the say yet
+		if (said * 3 <= all * 2 || !vouched(s, votes)) return () => { u.claims[key] = c ? { ...c, votes } : { by: p.to, net: p.net, token: p.token, amount: p.amount, tx: p.tx, at: time, votes }; }; // not enough of the say yet
 		return () => {
 			const units = N(saleUnitsFor(R, B(u.sold), B(p.amount))); // the curve's price now: whoever is confirmed first buys first
 			u.salePot -= units; u.sold += units;
@@ -519,7 +531,7 @@ function payWage(s: State, M: bigint) {
 export async function bonusWinner(s: State, w: string[], last: string, day: number): Promise<string> {
 	const list: [bigint, string][] = [];
 	let c = 0n;
-	for (const v of w) { const x = B(weightOf(s, v)); if (x > 0n) { c += x; list.push([c, v]); } }
+	for (const v of w) { const x = s.heart ? stakeTime(s, v) : B(weightOf(s, v)); if (x > 0n) { c += x; list.push([c, v]); } }
 	if (!c) return w.find((v) => v > last) ?? w[0];
 	const u = sunOf(s), x = B('0x' + (await sha256(`dznye-bonus:${u.btc ? u.btc.hash : s.last}:${day}`))) % c;
 	return list.find(([top]) => top > x)![1];
@@ -534,6 +546,7 @@ async function payDay(s: State, w: string[]) {
 	// day share checkerShareBp of the day's work pay (the pot; the bonus is apart), by stake (their own plus their backers', so splitting one stake over many
 	// keys earns nothing more); then everyone's hours start again. With no checkers, the block makers get it all.
 	const checkers: string[] = [];
+	const least = s.heart ? leastWorking(s, work) : [];
 	for (const k of keysOf(s.nodes ?? {})) {
 		const n = peek(s.nodes!, k) as { hrs?: number };
 		const st = s.stakes && own(s.stakes, k) ? s.stakes[k] : null;
@@ -541,7 +554,8 @@ async function payDay(s: State, w: string[]) {
 		if (n.hrs) s.nodes![k] = { ...s.nodes![k], hrs: 0 };
 	}
 	const cw = checkers.map((k) => B(weightOf(s, k))), cwTotal = cw.reduce((a, b) => a + b, 0n);
-	if (c.pot && cwTotal > 0n) {
+	if (s.heart) payHeart(s, busy, work, least, add);
+	if (c.pot && cwTotal > 0n && !s.heart) { // (the Heart upgrade pays the least working instead: payHeart)
 		const share = total ? N(B(c.pot) * B(LEDGER.checkerShareBp) / BP) : c.pot; // nobody made blocks: all of it
 		let given = 0;
 		checkers.forEach((k, i) => { const x = N(B(share) * cw[i] / cwTotal); add(k, x); given += x; });
@@ -557,30 +571,60 @@ async function payDay(s: State, w: string[]) {
 	for (const v of [...pay.keys()].sort()) payOut(s, v, pay.get(v)!);
 	u.work = {};
 }
+/** The Heart upgrade, once a chain day: those online who made the fewest blocks share their 5% by stake x time; the makers
+    of contracts are paid for the fees their contracts brought; and the exchange's fees are paid out in their own coins:
+    to validators by blocks made, to the least working, and to lockers by amount x time. */
+function payHeart(s: State, busy: string[], work: Record<string, number>, least: [string, bigint][], add: (v: string, n: number) => void) {
+	const h = s.heart!, u = sunOf(s), some = least.some(([, w]) => w > 0n);
+	if (h.least) { if (some) h.least = share(h.least, least, add); else { setSun(s, sunBal(s) + h.least); h.least = 0; } } // nobody but one: to the Sun
+	payMakers(s, (a, n) => { h.grants -= n; receive(s, a, n); });
+	const byWork = busy.map((v): [string, bigint] => [v, B(work[v])]);
+	const lockers: [string, bigint][] = [];
+	if (Object.keys(h.coin.k).length) for (const a of keysOf(u.locks).sort()) { const x = peek(u.locks, a) as LockAcct; if (!x.benched && x.weight) lockers.push([a, B(x.weight)]); }
+	const pay = (m: Record<string, number>, to: [string, bigint][], give: (a: string, coin: string, n: number) => void) => {
+		for (const coin of Object.keys(m).sort()) { const left = share(m[coin], to, (a, n) => give(a, coin, n)); if (left) m[coin] = left; else delete m[coin]; }
+	};
+	pay(h.coin.v, byWork, (a, coin, n) => payOut(s, a, n, (who, x) => creditCoin(s, who, coin, x)));
+	pay(h.coin.l, least, (a, coin, n) => payOut(s, a, n, (who, x) => creditCoin(s, who, coin, x)));
+	pay(h.coin.k, lockers, (a, coin, n) => creditCoin(s, a, coin, n));
+}
 /** Pay a validator `amount` and share it with its backers, automatically: it keeps its commission (10% unless it set
     its own), and the rest is split by stake: its own share to it, each backer's share straight to the backer. */
-function payOut(s: State, v: string, amount: number) {
+function payOut(s: State, v: string, amount: number, give: (who: string, n: number) => void = (who, n) => receive(s, who, n)) {
 	const st = s.stakes && own(s.stakes, v) ? s.stakes[v] : null, backers = s.delegations && own(s.delegations, v) ? s.delegations[v] : null;
 	const names = backers ? Object.keys(backers).sort() : [], D = names.reduce((n, k) => n + backers![k], 0), P = (st?.bond ?? 0) + D;
-	if (!D || !P) { receive(s, v, amount); return; }
+	if (!D || !P) { give(v, amount); return; }
 	const com = N(B(amount) * B(st?.commission ?? LEDGER.commissionDefaultBp) / 10_000n), toBackers = N(B(amount - com) * B(D) / B(P));
 	let paid = 0;
-	for (const k of names) { const x = N(B(toBackers) * B(backers![k]) / B(D)); if (x) { receive(s, k, x); paid += x; } }
-	receive(s, v, amount - paid);
+	for (const k of names) { const x = N(B(toBackers) * B(backers![k]) / B(D)); if (x) { give(k, x); paid += x; } }
+	give(v, amount - paid);
 }
 /** once a chain day: the bonus to a worker drawn by shards (bonusWinner); the fund's income, the DZY in hands and the block use recorded;
     then the commission sets tomorrow's fee floor from the fund against its buffer, and the policy rate steps toward the Taylor rule */
 async function newDay(s: State, M: bigint) {
 	const u = sunOf(s), c = u.council, f = u.fed, H = N(R.historyDays), w = workers(s);
+	if (s.heart) s.heart.day = dayOf(s);
 	if (crewOn(s)) await payDay(s, w);
 	else if (c.bonus && w.length) { const next = await bonusWinner(s, w, c.last, Math.floor(u.minute / N(DAY))); receive(s, next, c.bonus); c.last = next; c.bonus = 0; }
 	c.inc.push(c.today); c.today = 0; if (c.inc.length > H) c.inc.shift();
 	f.M.push(N(M)); if (f.M.length > H + 1) f.M.shift();
 	f.use.push([f.tx, f.blocks]); f.tx = 0; f.blocks = 0; if (f.use.length > H) f.use.shift();
 	const buffer = bufferFor(R, M, c.inc.map(B));
-	f.buffer = N(buffer); f.floor = N(nextFloor(R, B(f.floor), B(c.fund), buffer));
+	f.buffer = N(buffer); if (!s.heart) f.floor = N(nextFloor(R, B(f.floor), B(c.fund), buffer));
 	const growth = moneyGrowthBp(M, B(f.M[0]), B(f.M.length - 1)), [tx, bl] = f.use.reduce(([a, b], [x, y]) => [a + x, b + y], [0, 0]), useBp = useGapBp(R, B(tx), B(bl));
 	f.growth = N(growth); f.useGap = N(useBp); f.target = N(policyTarget(R, growth, useBp)); f.rate = N(nextRate(R, B(f.rate), B(f.target)));
+}
+/** the Heart upgrade: the fees released this minute, in their five parts. The lockers' 15% joins the raffle's prizes
+    (tickets by DZY locked x years); with nobody taking part it goes to the Sun. */
+function heartMinute(s: State, release: number): number {
+	const u = sunOf(s), h = s.heart!, x = splitCarry(s, release);
+	u.feePot -= release;
+	u.council.pot = (u.council.pot ?? 0) + x.v; u.council.today += x.v;
+	h.least += x.l; h.grants += x.g;
+	setSun(s, sunBal(s) + x.b + (u.W ? 0 : x.k));
+	if (u.W) u.valPool += x.k;
+	priceMinute(s);
+	return x.b;
 }
 /** the yearly base rate of every loan, in basis points (the policy rate) */
 export const policyRate = (s: State) => sunOf(s).fed.rate;
@@ -605,11 +649,14 @@ async function tick(s: State) {
 	//    and is never more than the fees released this minute
 	//    councilBp of the fees released go to the council fund (the validators' wage); the rest is the profit
 	const release = u.feePot === 0 ? 0 : N((B(u.feePot) + R.potMinutes - 1n) / R.potMinutes), toCouncil = N(B(release) * R.councilBp / BP), rest = release - toCouncil;
-	u.feePot -= release; u.council.fund += toCouncil; u.council.today += toCouncil; setSun(s, sunBal(s) + rest);
-	const sun0 = B(sunBal(s) - rest), out = SUPPLY_B - sun0 - B(u.salePot);
+	let rest0 = rest; // the Sun's own part of the fees: the drip is never more
+	if (s.heart) rest0 = heartMinute(s, release); // 40 / 30 / 5 / 10 / 15 (heart.ts); then only the drip is shared below
+	else { u.feePot -= release; u.council.fund += toCouncil; u.council.today += toCouncil; setSun(s, sunBal(s) + rest); }
+	const sun0 = B(sunBal(s) - rest0), out = SUPPLY_B - sun0 - B(u.salePot);
 	let drip = sun0 * R.dripBp * SUB * out / (BP * YEAR * SUPPLY_B);
-	if (u.minute >= dripCapFrom(s.chain) && drip > B(rest) * SUB) drip = B(rest) * SUB;
-	const profit = B(rest) * SUB + drip;
+	if (u.minute >= dripCapFrom(s.chain) && drip > B(rest0) * SUB) drip = B(rest0) * SUB;
+	if (s.x?.index) drip = 0n; // the index (ledger.ts): nothing enters people's hands without coin behind it; fees pay validators and holders
+	const profit = (s.heart ? 0n : B(rest) * SUB) + drip;
 	// 2. 40% to the validators' pot and 10% to deposits, whole units with fractions carried; the rest stays in the Sun
 	if (u.W) {
 		let owed = B(u.valOwed) + profit * R.validatorBp / BP;
@@ -673,30 +720,32 @@ async function tick(s: State) {
 
 /** After a block's transactions: the fee follows how full the block was, and if the clock has reached a new minute,
     one chain minute passes (exactly one, however long the chain stood still). */
-export async function sunBlock(s: State, time: number, txCount: number, proposer?: string) {
+export async function sunBlock(s: State, time: number, txCount: number, proposer?: string, bytes = 0) {
 	if (!s.sun) return;
 	if (!Number.isSafeInteger(txCount) || txCount < 0) fail('bad transaction count');
 	const u = sunOf(s), clock = Math.floor(time / 60_000);
 	// the fee follows how full the block was, never below the commission's floor
-	s.fee = Math.max(N(feeNext(R, B(s.fee ?? 1), B(txCount), R.maxTxPerBlock / 2n)), u.fed.floor);
+	// (the Heart upgrade: how full by weight, and the next block's limit follows)
+	if (s.heart) { const room = s.heart.size, full = fullness(s, bytes); s.fee = Math.max(N(feeNext(R, B(s.fee ?? 1), B(Math.min(full, room)), B(room) / 2n)), u.fed.floor, feeFloor(s)); sizeAfter(s, bytes); }
+	else s.fee = Math.max(N(feeNext(R, B(s.fee ?? 1), B(txCount), R.maxTxPerBlock / 2n)), u.fed.floor);
 	u.fed.tx += txCount; u.fed.blocks += 1;
 	if (proposer !== undefined && s.validators.includes(proposer)) {
 		u.worked[proposer] = u.minute; // it did its turn
 		if (crewOn(s)) (u.work ??= {})[proposer] = (u.work[proposer] ?? 0) + 1; // the crew upgrade: blocks made today, for pay by work
 	}
-	if (clock > u.stamp) { u.stamp = clock; dropStale(s, time); await tick(s); if ((s.fee ?? 0) < u.fed.floor) s.fee = u.fed.floor; } // a new day may have raised the floor
+	if (clock > u.stamp) { u.stamp = clock; dropStale(s, time); await tick(s); if ((s.fee ?? 0) < u.fed.floor) s.fee = u.fed.floor; if (s.heart) s.fee = Math.max(s.fee ?? 0, feeFloor(s)); } // a new day may have raised the floor
 }
 
 /* ---------- views ---------- */
 /** DZY the economy holds outside people's accounts and the Sun: locks and the pots on their way to people */
 export function sunHeld(s: State) {
 	const u = sunOf(s);
-	return { locked: u.L, pots: u.feePot + u.valPool + u.roundPot + u.holdPool + u.council.fund + u.council.bonus + (u.council.pot ?? 0), unsold: u.salePot };
+	return { locked: u.L, pots: u.feePot + u.valPool + u.roundPot + u.holdPool + u.council.fund + u.council.bonus + (u.council.pot ?? 0) + heartHeld(s), unsold: u.salePot };
 }
 /** where the 12,000,000 are. The Sun, unsold and locked DZY are out of circulation; none is ever destroyed. */
 export function sunSupply(s: State) {
 	const h = sunHeld(s), sun = sunBal(s);
-	return { supply: SUN_SUPPLY, sun, unsold: h.unsold, sold: sunOf(s).sold, locked: h.locked, pots: h.pots, circulating: SUN_SUPPLY - sun - h.unsold - h.locked - h.pots, price: N(salePrice(R, B(sunOf(s).sold))), fee: s.fee ?? 0, minute: sunOf(s).minute, btc: sunOf(s).btc ? { height: sunOf(s).btc!.height, hash: sunOf(s).btc!.hash, time: sunOf(s).btc!.time } : null };
+	return { supply: SUN_SUPPLY, sun, unsold: h.unsold, sold: sunOf(s).sold, locked: h.locked, pots: h.pots, circulating: SUN_SUPPLY - sun - h.unsold - h.locked - h.pots, price: s.heart ? spotPrice(s) : N(salePrice(R, B(sunOf(s).sold))), fee: s.fee ?? 0, minute: sunOf(s).minute, lockWeight: sunOf(s).W, lockers: sunOf(s).N, btc: sunOf(s).btc ? { height: sunOf(s).btc!.height, hash: sunOf(s).btc!.hash, time: sunOf(s).btc!.time } : null };
 }
 /** the chain's economy as its central bank sees it (GET /economy): every number the rules act on, so anyone can check them */
 export function economyView(s: State) {

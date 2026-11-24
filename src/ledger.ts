@@ -1,10 +1,17 @@
 import { rootCacheFor, stateRootOf } from './root.ts';
+import { wotsRoot } from './wots.ts';
+import { emptyOf, keysOf, peek } from './layer.ts';
 import { canon, fromSolana, merkleRoot, sha256, sha256Bytes, sign, toBase58, verify } from './crypto.ts';
 import { personalSigner } from './secp.ts';
-import { btcAddress, btcMessageSigners, sha256 as btcSha256 } from './btc.ts';
+import { btcAddress, btcMessageSigners, BTC_FLOOR, checkHeader, merkleRootOf, opReturnData, parseTx, sha256 as btcSha256 } from './btc.ts';
 import { checkCall, checkProgram, ContractFailure, LIMITS, run, type Program, type Value, type World } from './contracts.ts';
+import { backAdded, backGone, benchable, bondAdded, clockAfter, coinFee, curveOf, drawHeartCrew, grantOf, HEART, KEPT, keptAdd, keptTimes, newEntries, payPrice, seatFor, setIndexPrice, sizeFees, spotPrice, takeBacking, unitsFor, heartCoin, instantLeft, instantUse, mayVouch, missed as missedTurn, ownHours, FUTURE, PROOF, roomOf, startFuture, workAdd, startHeart, startProof, startTime, vouched, vouchers, turnFor, type HeartState } from './heart.ts';
+import { EVM_HANDLERS, EVM_RULES, evmHeld, type EvmAcct, type EvmState } from './evmledger.ts';
+import { BLOB_HANDLERS, blobHeld, royaltyIn, type Blob, type BlobBank, type Col, type Drop, type Look, type Nft } from './blobs.ts';
+import { checkOp, isOwner, layerRoot, opMessage, ZONE_HANDLERS, zoneHeld, type Bank, type Batch, type Dep, type Layer } from './zones.ts';
 import { RULES as V2 } from '../v2/rules.mjs';
-import { salePrice, saleUnitsFor } from '../v2/sale.mjs';
+import { saleBackFor, saleCost, salePrice, saleUnitsFor } from '../v2/sale.mjs';
+import { lockOf, lockOut, SUN_SUPPLY } from './sun.ts';
 import { charge as sunCharge, creditCovers, creditUse, lockFreeLeft, lockFreeUse, policyRate, openTickets, receive as sunReceive, refund as sunRefund, spend as sunSpend, SUN_HANDLERS, sunBlock, sunGenesis, sunHeld, sunPayment, sunPays, sunSupply, sunView, toSun, MAX_SUN_LOCKS, type SunState } from './sun.ts';
 export { openTickets, sunBlock, sunGenesis, sunPayment, sunSupply, sunView };
 export { creditView, economyView, lockFreeLeft } from './sun.ts';
@@ -30,7 +37,7 @@ export const MONTH = 30 * 24 * 60 * 60 * 1000;
 
 /* Who the 12,000,000 DZY are for. Every DZY is issued from one of these pools and the chain itself holds each pool
    to its limit and its timetable: a part may be free from the first block, the rest unlocks evenly, month by month,
-   after an optional wait. Nobody, the founder included, can issue ahead of the timetable. Time counts from block 1. */
+   after an optional wait. Nobody can issue ahead of the timetable. Time counts from block 1. */
 export interface Pool { cap: number; atStart: number; cliff: number; months: number; what: string }
 export const POOLS: Readonly<Record<string, Pool>> = Object.freeze({
 	community: { cap: 6_000_000 * DZY, atStart: 300_000 * DZY, cliff: 0, months: 96, what: 'Earned by people who use and build on the chain: rewards, contests, grants for real use' },
@@ -66,7 +73,7 @@ export const RULES = {
 	nameMax: 40,
 	/* ---- creators: tips and items for sale (tip, item.buy) ---- */
 	saleFeeBps: 50, // 0.5% of every tip and sale goes to saleFeeTo; the creator gets the rest
-	saleFeeTo: '6653763632eb15f0e36df4f6710722e95ac555939df956aac01f1cf8f9341ac4', // the founder's account (the founding validator)
+	saleFeeTo: '6653763632eb15f0e36df4f6710722e95ac555939df956aac01f1cf8f9341ac4', // the network's fee account
 	tipMsgMax: 140, tipsKept: 20, // a tip's public message, and how many of the latest a creator's tip box shows
 	/* checkout from any wallet or exchange (order.*): the buyer pays the creator's own address on another chain */
 	orderLife: 60 * 60 * 1000, // an order waits this long for its payment
@@ -76,8 +83,10 @@ export const RULES = {
 	maxOpenOrders: 5, // open orders one buyer may have
 	feeOwedMax: 20_000_000, // a creator owing more than $20 of fees cannot take outside payments until they pay it
 	maxEditions: 1_000_000,
-	maxTxChars: 2000,
+	maxTxChars: 2000, maxBtcChars: 9_000,
 	batchMax: 100, maxBatchChars: 10_000, // transfer.many: up to 100 payments in one transaction (a longer one), one fee per 20
+	maxPartChars: 61_000, // a file's part: 45,000 bytes, as text, beside its transaction
+	maxProofChars: 10_000, // layer.prove carries a step and the accounts it touched
 	maxTxPerBlock: 500,
 	clockSlack: 30_000, // a live node refuses a block dated more than this far past its own clock (time unlocks pools, stakes, recoveries)
 	maxWaiting: 5000, // transactions a validator holds waiting for a block, from everyone together
@@ -164,7 +173,7 @@ export const RULES = {
 	xFeeBps: 10, // the exchange: 0.1% of every coin paid out (or a lock closed) goes to the pot, the floor behind DZY
 	xTradeBps: 5, // 0.05% of the vault coin in every order-book fill goes to the pot
 	hubBps: 4 // ... and this much of the DZY side goes to the treasury: the chain's own income from being in the middle.
-	// Together 0.20%: a third less than the 0.30% most pools elsewhere charge (the owner's choice, 2026-11-15)
+	// Together 0.20%: a third less than the 0.30% most pools elsewhere charge (2026-11-15)
 } as const;
 /** other chains an account may link an address on, and how the chain checks that the address agreed. `sol`: Solana
     uses the same kind of key as Dznye, so the chain checks that key's signature itself. */
@@ -224,14 +233,14 @@ export function recordOf(s: State, writer: string, space: string, key: string) {
 	return r ? { writer, space, key, ...r } : null;
 }
 /** one writer's records in a space, by key (at most `limit`, after `after`) */
-export function recordsOf(s: State, writer: string, space: string, limit = 100, after = '') {
+export function recordsOf(s: State, writer: string, space: string, limit = 100, after = '', keys: string[] = Object.keys(s.records ?? {})) {
 	const pre = `${writer}/${space}/`;
-	return Object.keys(s.records ?? {}).filter((k) => k.startsWith(pre) && k.slice(pre.length) > after).sort().slice(0, limit).map((k) => ({ writer, space, key: k.slice(pre.length), ...s.records![k] }));
+	return keys.filter((k) => k.startsWith(pre) && k.slice(pre.length) > after).sort().slice(0, limit).map((k) => ({ writer, space, key: k.slice(pre.length), ...s.records![k] }));
 }
 /** a space across every writer, newest first (at most `limit`, written before `before`) */
-export function spaceRecords(s: State, space: string, limit = 100, before = Infinity) {
+export function spaceRecords(s: State, space: string, limit = 100, before = Infinity, keys: string[] = Object.keys(s.records ?? {})) {
 	const out: { writer: string; space: string; key: string; value?: unknown; hash?: string; link?: string; at: number }[] = [];
-	for (const [k, r] of Object.entries(s.records ?? {})) { const [writer, sp, ...rest] = k.split('/'); if (sp === space && r.at < before) out.push({ writer, space, key: rest.join('/'), ...r }); }
+	for (const k of keys) { const r = s.records![k], [writer, sp, ...rest] = k.split('/'); if (sp === space && r.at < before) out.push({ writer, space, key: rest.join('/'), ...r }); }
 	return out.sort((a, b) => b.at - a.at || (a.writer + a.key < b.writer + b.key ? -1 : 1)).slice(0, limit);
 }
 /** A stream: `perMinute` of `asset` flowing from `from` to `to`. `held`: still to flow, counted from `start`;
@@ -254,13 +263,15 @@ export function streamView(s: State, id: string, time: number = s.time) {
    `signer` says which one did, when it was not the first.
    `payer` (optional) is another account that pays this transaction's fee: an app covering its users, so they never
    need to hold DZY. The sender names the payer inside what it signs, and the payer signs too (`payerSig`). */
-export interface Tx { chain: string; from: string; nonce: number; type: string; data: Record<string, unknown>; sig: string; signer?: string; payer?: string; payerSig?: string; cosigs?: { key: string; sig: string }[] }
+export interface Tx { chain: string; from: string; nonce: number; type: string; data: Record<string, unknown>; sig: string; /** the last rules: more than the fee, to go first when blocks are full; and the most fee it may cost (above it, it waits) */ tip?: number; max?: number; signer?: string; payer?: string; payerSig?: string; cosigs?: { key: string; sig: string }[]; side?: string } // side: a file part's bytes, beside the transaction (blobs.ts): not signed, not in the block's fingerprint; matched by the file's own
 export interface Account {
 	nonce: number;
 	bal: Record<string, number>;
 	keys?: string[]; // extra device keys
 	off?: true; // the first key has been switched off (a lost first device)
 	guardian?: string; // who may start a recovery, if the owner chose one
+	/** a hash-based key (wots.ts), the next one to sign, and how many have; `only`: nothing else moves this account */
+	q?: { root: string; n: number; only?: true };
 	recover?: { key: string; at: number }; // a recovery waiting out its delay: this key joins at this time unless cancelled
 	/** limited keys for software acting for the owner (an AI agent, a game, a subscription): each may only SEND one
 	    asset, up to what is left of its allowance, until its end time. It can never add keys or touch anything else. */
@@ -289,6 +300,7 @@ export interface Asset {
 	/** reward points with real value (points.create): every point in existence has `per` DZY shards behind it, held by
 	    the chain in `reserve` (always exactly supply × per), which any holder can cash in at that rate at any time */
 	backed?: { per: number; reserve: number };
+	nft?: Nft; // a token that shows a file (blobs.ts): `backed` is the DZY in every copy
 }
 /** DZY a validator has locked up. `bond` counts towards a seat; `unbonding` is on its way out (still answerable for
     cheating until it is withdrawn); `missed` counts turns to propose missed in a row; `jailed` = benched until this
@@ -298,7 +310,7 @@ export interface Asset {
 export interface Undelegation { v: string; amount: number; at: number }
 /** a proposed treasury payout, open for votes until `until`. Votes are counted at their voters' stake when counted. */
 export interface Proposal { by: string; to: string; amount: number; reason: string; until: number; votes: Record<string, boolean> }
-export interface Stake { bond: number; unbonding?: { amount: number; at: number }[]; missed?: number; jailed?: number; tomb?: true; commission?: number } // commission: basis points of its pay it keeps before its backers' share (the crew upgrade)
+export interface Stake { bond: number; since?: number; /** DZY moved here from locks: each part held until that chain minute */ kept?: { n: number; m: number }[]; unbonding?: { amount: number; at: number }[]; missed?: number; jailed?: number; tomb?: true; commission?: number } // commission: basis points of its pay it keeps before its backers' share (the crew upgrade)
 /** one signed consensus vote, as carried in a proof of cheating */
 export interface SignedVote { type: 'prevote' | 'precommit'; height: number; round: number; block: string | null; validator: string; sig: string }
 /** a program on the chain: its code, who put it there, and what it has stored. Its coins are in its account. */
@@ -534,10 +546,27 @@ export interface State {
 	/** checkouts paid on another chain straight to the creator, by id; and the 0.5% each creator owes for them (µ$) */
 	orders?: Record<string, Order>;
 	feeOwed?: Record<string, number>;
+	/** limited editions their owners offer (resale.list): owner/seller/item -> the dollar price and the fee it was listed
+	    with; and what each item's resales came to (kept apart from sales, which count editions sold) */
+	listings?: Record<string, { usd: number; bps: number; at: number }>;
+	resales?: Record<string, { n: number; usd: number; last: number; at: number }>;
+	/** creators who joined (creator.join): address -> when */
+	creators?: Record<string, number>;
+	/** the creators' fee now, in basis points (fee.set, from the checkout upgrade); absent: RULES.saleFeeBps */
+	saleFeeBps?: number;
 	/** tasks sites pay for, by id (absent until one is posted) */
 	tasks?: Record<string, Task>;
 	/** the crew upgrade: each staked key's node, as it last checked in (its public address, and when) */
-	nodes?: Record<string, { url?: string; at: number; hr?: number; hrs?: number }>; // hr: the clock hour of its last check-in; hrs: hours seen in since the last pay day
+	nodes?: Record<string, { url?: string; at: number; hr?: number; hrs?: number; on?: number; ch?: number; seat?: number; big?: number }>; // seat: the stake its place asks; big: the biggest block it takes; on, ch: the Heart upgrade's time online (heart.ts)
+	/** the Heart upgrade: where a validator's clock stood when a holder backed it ("validator:holder") */
+	backed?: Record<string, number>;
+	heart?: HeartState;
+	/** layers on top of this chain (zones.ts): each one, its batches ("layer/n"), and the deposits into it ("layer/q") */
+	xwaits?: Record<string, XWait>; xlocks?: Record<string, number>; xloans?: Record<string, Loan>; xparks?: Record<string, 1>; books?: Record<string, string[]>; orderOf?: Record<string, string[]>; blobs?: Record<string, Blob>; looks?: Record<string, Look>; cols?: Record<string, Col>; drops?: Record<string, Drop>; dropped?: Record<string, 1>; // files that last, collections and drops (blobs.ts)
+	/** Ethereum contracts (evmledger.ts): what was brought in, by asset; accounts; code by its hash; storage */
+	evm?: EvmState; evmAccts?: Record<string, EvmAcct>; evmCodes?: Record<string, string>; evmSlots?: Record<string, string>;
+	layers?: Record<string, Layer>; lbatches?: Record<string, Batch>; ldeps?: Record<string, Dep>;
+	// nodes: hr: the clock hour of its last check-in; hrs: hours seen in since the last pay day
 	/** checkers: the hashes of the last RULES.recentBlocks blocks before the newest, oldest first (`h`: the first one's
 	    height). Kept from the crew upgrade on. The newest block's hash is `last`. */
 	recent?: { h: number; hashes: string[] };
@@ -546,6 +575,12 @@ export interface State {
 	x?: XState;
 	/** the exchange's payouts, by id: what a vault must pay, to whom, on which network (tx: the payment, once made) */
 	xpays?: Record<string, XPayout>;
+	/** business offers: each business's orders and bookings (newest last), and how many are booked in each slot ("seller/item/at") */
+	biz?: Record<string, BizEntry[]>; slots?: Record<string, number>;
+	/** shops in their 40 free days: when each one's $5 falls due */
+	joinDue?: Record<string, number>;
+	/** DZY on Solana: what the chain holds for the wDZY people have there */
+	wdzy?: { held: number };
 	/** deposits counted, by "net:payment id" (each counted once), and deposits waiting for enough validators */
 	/** Up or Down rounds (round.*): "COIN:period:start" -> the round */
 	rounds?: Record<string, Round>;
@@ -554,7 +589,7 @@ export interface State {
 	xseen?: Record<string, { at: number; to: string; coin: string; amount: number; dzy: number }>;
 	xclaims?: Record<string, { at: number; votes: string[] }>;
 	/** the crew upgrade: who makes blocks this period, and each one's seats (its say) */
-	crew?: { epoch: number; validators: string[]; powers: Record<string, number> };
+	crew?: { epoch: number; validators: string[]; powers: Record<string, number>; seed?: string };
 	/** the Sun: this chain's own economy, chosen at genesis (sunGenesis). All 12,000,000 DZY exist from block 1, the
 	    treasury above IS the Sun, nobody can issue DZY or pay the Sun out, and every minute's profit is shared by the
 	    formulas in sun.ts. Absent on chains made by genesis(), which replay exactly as before. */
@@ -590,7 +625,7 @@ export const voteMessage = (chain: string, type: 'prevote' | 'precommit', height
 	'dzy-vote:' + canon({ chain, type, height, round, block });
 
 /** the exact text a sender signs; the chain name inside stops a transaction being replayed on another chain */
-export const txMessage = (t: Omit<Tx, 'sig' | 'payerSig'>) => 'dzy-tx:' + canon({ chain: t.chain, from: t.from, nonce: t.nonce, type: t.type, data: t.data, signer: t.signer, payer: t.payer });
+export const txMessage = (t: Omit<Tx, 'sig' | 'payerSig'>) => 'dzy-tx:' + canon({ chain: t.chain, from: t.from, nonce: t.nonce, type: t.type, data: t.data, signer: t.signer, payer: t.payer, tip: t.tip, max: t.max });
 export const txId = (t: Omit<Tx, 'sig' | 'payerSig'>) => sha256(txMessage(t));
 /** what a fee payer signs: exactly the sender's transaction, under its own label so neither signature can stand in for the other */
 export const payerMessage = (t: Omit<Tx, 'sig' | 'payerSig'>) => 'dzy-pay:' + txMessage(t);
@@ -604,9 +639,18 @@ export async function signPayer(secret: string, tx: Tx): Promise<Tx> {
 }
 /** what one transaction costs in fees on this state. Issuing DZY from the pools is free: otherwise nobody could get the first DZY. */
 export function feeFor(s: State, tx: Pick<Tx, 'from' | 'type' | 'data'>): number {
+	const base = plainFee(s, tx);
+	return s.heart && base ? Math.max(base, (tx.type === 'transfer.many' ? s.fee ?? 0 : base) + sizeExtra(s, tx)) + entryExtra(s, tx) : base;
+}
+/** the Heart upgrade: what an action's size adds to its fee (baggage: one fee for every 1,000 characters past the first) */
+export const sizeExtra = (s: State, tx: Pick<Tx, 'data'> & { type?: string }) => (s.heart ? (s.fee ?? 0) * (sizeFees(canon(tx.data).length) - 1) : 0);
+/** the Heart upgrade: what the lasting entries an action adds cost (heart.ts KEPT) */
+const entryExtra = (s: State, tx: Pick<Tx, 'type' | 'data'>) => (s.fee ?? 0) * KEPT.entryFees * newEntries(s, tx) * keptTimes(s);
+function plainFee(s: State, tx: Pick<Tx, 'from' | 'type' | 'data'>): number {
 	if (tx.type === 'mint' && tx.from === s.authority && tx.data?.asset === NATIVE) return 0;
 	if ((tx.type === 'xoffer.attest' || tx.type === 'order.attest') && s.validators.includes(tx.from)) return 0; // validators reporting a payment: part of running the chain
 	if (tx.type === 'contract.call' || tx.type === 'contract.deploy') return gasFee(s, gasLimitOf(tx.data));
+	if (s.heart && tx.type === 'node.checkin' && isCandidate(s, tx.from) && canon(tx.data).length <= 1_000) return 0; // a validator saying it is there (at most one every few minutes): part of running the chain, and a small one must not be eaten by it
 	if (tx.type === 'ticket.answer') return 0; // collecting a raffle prize is free (and each ticket can be collected once)
 	if (tx.type === 'credit.take' && s.sun) return 0; // taking starter credit: an account with no DZY could not pay (limited to creditPerDay a day)
 	if ((tx.type === 'sun.attest' || tx.type === 'sun.btc') && s.validators.includes(tx.from)) return 0;
@@ -651,8 +695,226 @@ const height_ = (s: State) => s.height + 1;
     leaving out `who`'s own and those that have ended. */
 function bookFor(s: State, give: string, want: string, who: string, time: number): string[] {
 	const ks: string[] = [];
+	if (s.heart) { // each pair's own list (kept by bookAdd): not looked for in all the offers of the chain
+		const b = s.books && own(s.books, want + '|' + give) ? s.books[want + '|' + give] : [];
+		return byPrice(s, b.filter((k) => { const o = own(s.offers, k) ? s.offers[k] : null; return !!o && o.maker !== who && !(o.until !== undefined && time > o.until); }));
+	}
 	for (const [k, o] of Object.entries(s.offers)) if (o.give.asset === want && o.want.asset === give && o.maker !== who && !(o.until !== undefined && time > o.until)) ks.push(k);
+	return byPrice(s, ks);
+}
+function byPrice(s: State, ks: string[]): string[] {
 	return ks.sort((a, b) => { const x = s.offers[a], y = s.offers[b], l = BigInt(x.want.amount) * BigInt(y.give.amount), r = BigInt(y.want.amount) * BigInt(x.give.amount); return l < r ? -1 : l > r ? 1 : a < b ? -1 : 1; });
+}
+/** The Heart upgrade: each pair's open offers, the best KEPT.bookMax of them (the rest stay open, to be taken by name). */
+function bookAdd(s: State, key: string, time: number) {
+	if (!s.heart) return;
+	const o = s.offers[key], p = o.give.asset + '|' + o.want.asset, was = s.books && own(s.books, p) ? s.books[p] : [];
+	const live = was.filter((k) => own(s.offers, k) && !(s.offers[k].until !== undefined && time > s.offers[k].until!));
+	(s.books ??= {})[p] = byPrice(s, [...live, key]).slice(0, KEPT.bookMax);
+}
+function bookDrop(s: State, o: Offer, key: string) {
+	if (!s.heart || !s.books) return;
+	const p = o.give.asset + '|' + o.want.asset; if (!own(s.books, p) || !s.books[p].includes(key)) return;
+	const rest = s.books[p].filter((k) => k !== key); if (rest.length) s.books[p] = rest; else { delete s.books[p]; if (emptyOf(s.books)) delete s.books; }
+}
+/** The Heart upgrade: the open checkouts of a buyer ("b" + address) and of a creator ("s" + address) */
+function ordersOf(s: State, who: string): string[] { return s.orderOf && own(s.orderOf, who) ? s.orderOf[who].filter((k) => !!s.orders && own(s.orders, k)) : []; }
+function orderAdd(s: State, key: string) { if (!s.heart) return; const o = s.orders![key]; for (const w of ['b' + o.buyer, 's' + o.seller]) (s.orderOf ??= {})[w] = [...ordersOf(s, w), key]; }
+function orderDrop(s: State, key: string) {
+	const o = s.orders![key]; delete s.orders![key]; if (emptyOf(s.orders!)) delete s.orders;
+	if (!s.heart || !s.orderOf) return;
+	for (const w of ['b' + o.buyer, 's' + o.seller]) { if (!s.orderOf || !own(s.orderOf, w)) continue; const rest = s.orderOf[w].filter((k) => k !== key); if (rest.length) s.orderOf[w] = rest; else { delete s.orderOf[w]; if (emptyOf(s.orderOf)) delete s.orderOf; } }
+}
+/** locks, loans and parked accounts: inside `x` before the Heart upgrade, collections of their own from it on */
+/** a payment into a vault counts: the coin is held, and whoever it is for gets what it buys (or the coin, as free coin) */
+export interface XWait { net: string; coin: string; amount: number; to: string; at: number; until: number; votes?: string[]; by?: string; block?: [number, string] }
+/** TEST ONLY: easier Bitcoin work for a test chain */
+const TEST_FLOOR = new Map<string, bigint>();
+export function testBtcFloor(chain: string, floor: bigint | null) { if (floor === null) TEST_FLOOR.delete(chain); else TEST_FLOOR.set(chain, floor); }
+const dropClaims = (s: State, seen: string) => { if (s.xclaims) for (const k of keysOf(s.xclaims)) if (k.startsWith(seen + ':')) delete s.xclaims[k]; };
+function depositCounts(s: State, height: number, pay: { net: string; coin: string; amount: number; to: string; seen: string }, time: number, orderTime: number) {
+	const { net, coin, amount, seen } = pay;
+	const ok = checkoutV2(s, height) ? taggedOrder(s, pay.to, coin, net, orderTime) : null, o = ok ? s.orders![ok] : null;
+	if (ok && o && (amount >= o.due || amount >= Math.floor((o.base * 99) / 100))) { completeOrder(s, ok, amount, time, seen); dropClaims(s, seen); return; }
+	const to = o ? o.buyer : pay.to; // short of the price: the buyer's own, as free coin
+	const x = xOf(s), held = `${net}:${coin}`, lim = X_LIMITS[coin], u = s.sun!;
+	const vaultTotal = Object.entries(x.vaults).filter(([k]) => k.endsWith(':' + coin)).reduce((n, [, v]) => n + v, 0);
+	x.vaults[held] = (x.vaults[held] ?? 0) + amount;
+	const price = xPrice(s, coin, time), usd = price === null ? 0n : (B(amount) * B(price)) / 10n ** B(X_COINS[coin].decimals);
+	const parked = !!o || isParked(s, to) || !!retiredOf(s, coin); // (a retired coin buys no DZY: it stays the payer's own)
+	const capped = !xUnlimited(s, height), units = parked || price === null || (capped && (amount > lim.deposit || vaultTotal + amount > lim.vault)) || u.salePot <= 0 ? 0 : indexOn(s) ? indexBuyUnits(s, usd, time) : N(unitsFor(s, usd, s.heart ? xFloor(s, time) : null));
+	const given = units > 0 && units <= u.salePot ? units : 0;
+	if (given && indexOn(s)) indexBought(s, usd, time); // its fee washes (at the price it bought at, before the coin counts)
+	if (given) { u.salePot -= given; u.sold += given; add(s, to, NATIVE, given); if (indexOn(s) || reserveOn(s, height)) { claimAsset(s, coin); potAdd(s, coin, amount); } else lockAdd(s, `${to}:${coin}`, amount); } // into the shared reserve (before it: locked in the buyer's own name)
+	else { claimAsset(s, coin).supply += amount; claimAsset(s, coin).minted += amount; add(s, to, 'x' + coin, amount); } // free coin, theirs: to trade or take straight back
+	(s.xseen ??= {})[seen] = { at: time, to, coin, amount, dzy: given };
+	dropClaims(s, seen);
+}
+/* The shared reserve (24 Nov 2026; from the block below). DZY has one price, the chain's, like gold:
+   bought with any coin, sold back for any coin, at that price, with nothing added or taken but the chain's fee.
+   - Buying from the sale (a deposit into a vault, or a coin on Dznye through Convert): the coin goes into ONE reserve the
+     chain holds (x.pot), not a lock in the buyer's own name.
+   - Selling DZY to the chain (Convert, DZY to a coin): it pays what those DZY cost on the curve right now (saleCost of the
+     stretch they return), in the coin asked, from the reserve, as free coin on Dznye (D.USDC, D.BNB…) that anyone takes
+     out to its own chain. The DZY go back to the sale, so the price comes down the same curve it went up.
+   - No cap: a free market. A sale is limited only by what the reserve holds of that coin; the chain's fees, paid on
+     every move, are what lift DZY over time.
+   Locks made before stay as they were (their owners close them as before). */
+const RESERVE_FROM: Record<string, number> = { 'dznye-mainnet': 11_400 };
+const TEST_RESERVE = new Map<string, number>();
+/** TEST ONLY: the block a test chain's sale fills the shared reserve from (null: back to the rule) */
+export function testReserveFrom(chain: string, height: number | null) { if (height === null) TEST_RESERVE.delete(chain); else TEST_RESERVE.set(chain, height); }
+export const reserveFrom = (chain: string) => TEST_RESERVE.get(chain) ?? (Object.hasOwn(RESERVE_FROM, chain) ? RESERVE_FROM[chain] : Infinity);
+export const reserveOn = (s: State, height: number = s.height + 1) => !!s.heart && height >= reserveFrom(s.chain);
+/** what selling `dzy` to the chain pays in `coin` now (its units), at the chain's own price, or null (no price, too much) */
+export function reserveSale(s: State, coin: string, dzy: number, time: number = s.time): { pay: number; usd: number } | null {
+	const u = s.sun!, price = xPrice(s, coin, time);
+	if (!price || dzy <= 0 || dzy > u.sold) return null;
+	const usd = saleCost(curveOf(s), B(u.sold - dzy), B(u.sold)); // what these DZY cost on the curve now
+	const pay = N((usd * 10n ** B(X_COINS[coin].decimals)) / B(price));
+	return pay > 0 ? { pay, usd: N(usd) } : null;
+}
+/* The index (24 Nov 2026): DZY's price stops being a curve and becomes what stands behind it, like a
+   share of an index fund. Nobody holds the reserve: the chain does.
+   - Price = the reserve's value in dollars (every coin in it at its agreed price) ÷ the BACKED DZY in people's hands.
+   - It turns on at INDEX_FROM. At that block the DZY in hands that the reserve does not cover at today's curve price are
+     counted once as unbacked (x.unbacked: early DZY, from before the index). They are left out of the price, so the
+     price starts exactly at today's and every other DZY is fully backed.
+   - Washing: half of every fee (WASH_BP) backs unbacked DZY until none are left; the other half stays in the reserve and
+     lifts the price for everyone who holds. A gift to the reserve (reserve.give) washes first, then lifts the price.
+   - Buying: a coin (a vault deposit, or free coin through Convert) buys DZY at the index price, less RULES.xFeeBps; the
+     coin goes into the reserve. Selling: DZY pay the index price in any coin the reserve holds, less the same fee. The
+     DZY go back to the unsold. No daily limit: only what the reserve holds of that coin.
+   - Nothing new enters people's hands without coin behind it: from the switch the Sun's drip and its free fees for small
+     accounts stop (sun.ts); validators and holders are paid from the fees people pay, DZY already in hands.
+   - The price moves with the coins themselves (Bitcoin up, DZY up by its share) and with every fee left in the reserve. */
+const INDEX_FROM: Record<string, number> = { 'dznye-mainnet': 13_500 };
+/* Gold in the reserve (24 Nov 2026): tokenized gold, PAXG and XAUT (an ounce each, in the Ethereum
+   vault, priced by Chainlink's XAU / USD feed), from the same block as the index. With the dollars and the crypto it
+   makes the reserve a mix: steady, with a kick. */
+const GOLD = new Set(['PAXG', 'XAUT']);
+const GOLD_FROM: Record<string, number> = { 'dznye-mainnet': 13_500 };
+const TEST_GOLD = new Map<string, number>();
+/** TEST ONLY: the block gold counts from on a test chain (null: back to the rule) */
+export function testGoldFrom(chain: string, height: number | null) { if (height === null) TEST_GOLD.delete(chain); else TEST_GOLD.set(chain, height); }
+export const goldFrom = (chain: string) => TEST_GOLD.get(chain) ?? (Object.hasOwn(GOLD_FROM, chain) ? GOLD_FROM[chain] : Infinity);
+const WASH_BP = 5_000n; // of every fee: washes unbacked DZY first (the rest lifts the price)
+const TEST_INDEX = new Map<string, number>();
+/** TEST ONLY: the block a test chain's index turns on at (null: back to the rule) */
+export function testIndexFrom(chain: string, height: number | null) { if (height === null) TEST_INDEX.delete(chain); else TEST_INDEX.set(chain, height); }
+export const indexFrom = (chain: string) => TEST_INDEX.get(chain) ?? (Object.hasOwn(INDEX_FROM, chain) ? INDEX_FROM[chain] : Infinity);
+/** is DZY priced by the index (it turned on at a block, kept in the state) */
+export const indexOn = (s: State) => !!s.x?.index;
+/** past the index's block but not turned on yet (a coin had no agreed price at its block): nobody sells into the reserve */
+const indexWaiting = (s: State, height: number = s.height + 1) => !!s.heart && !indexOn(s) && height >= indexFrom(s.chain);
+/** the price as a fraction: the reserve's value (µ$) over the backed DZY in hands; with nothing backed yet, the last price.
+    Null: a coin in the reserve has no agreed price right now */
+function indexNav(s: State, time: number): { usd: bigint; hands: bigint } | null {
+	const f = xFloor(s, time);
+	if (!f) return null;
+	const backed = f.hands - B(s.x?.unbacked ?? 0);
+	if (backed > 0n && f.usd > 0n) return { usd: f.usd, hands: backed };
+	return s.x?.nav ? { usd: B(s.x.nav), hands: B(DZY) } : null;
+}
+/** DZY's index price now (µ$), or null */
+export function indexPrice(s: State, time: number = s.time): number | null { const n = indexNav(s, time); return n ? N((n.usd * B(DZY)) / n.hands) : null; }
+/** `usd` µ$ of a fee (or a gift) left in the reserve: `part` (basis points) of it backs unbacked DZY at the price before it */
+function wash(s: State, n: { usd: bigint; hands: bigint }, usd: bigint, part: bigint) {
+	const x = s.x!, left = B(x.unbacked ?? 0);
+	if (!left || usd <= 0n) return;
+	const w = (usd * part * n.hands) / (10_000n * n.usd), take = w < left ? w : left;
+	if (take > 0n) { x.unbacked = N(left - take); if (!x.unbacked) delete x.unbacked; }
+}
+/** DZY that `usd` µ$ of coin buys at the index price, after the fee that stays in the reserve (0: no price) */
+export function indexBuyUnits(s: State, usd: bigint, time: number = s.time): number {
+	const n = indexNav(s, time);
+	return n && usd > 0n ? N((usd * B(10_000 - RULES.xFeeBps) * n.hands) / (10_000n * n.usd)) : 0;
+}
+/** a buy at the index went through: its fee washes */
+function indexBought(s: State, usd: bigint, time: number) { const n = indexNav(s, time); if (n) wash(s, n, (usd * B(RULES.xFeeBps)) / 10_000n, WASH_BP); }
+/** what selling `dzy` pays in `coin` (its units) at the index price, after the fee that stays in the reserve, or null */
+export function indexSale(s: State, coin: string, dzy: number, time: number = s.time): { pay: number; usd: number; fee: number } | null {
+	const n = indexNav(s, time), price = xPrice(s, coin, time);
+	if (!n || !price || dzy <= 0 || dzy > s.sun!.sold) return null;
+	const gross = (B(dzy) * n.usd) / n.hands, usd = (gross * B(10_000 - RULES.xFeeBps)) / 10_000n;
+	const pay = N((usd * 10n ** B(X_COINS[coin].decimals)) / B(price));
+	return pay > 0 ? { pay, usd: N(usd), fee: N(gross - usd) } : null;
+}
+/** at a block's end: the index turns on at its block (the unbacked counted once); while on, its last price is kept, for
+    when a coin's price is missing for a while */
+function indexBlock(s: State, height: number, time: number) {
+	if (!s.heart || !s.sun || height < indexFrom(s.chain)) return;
+	if (indexOn(s)) { const p = indexPrice(s, time); if (p !== null) s.x!.nav = p; return; }
+	const f = xFloor(s, time), p0 = spotPrice(s);
+	if (!f || p0 <= 0) return; // a coin with no agreed price: try at the next block
+	const covered = (f.usd * B(DZY)) / B(p0), un = f.hands > covered ? f.hands - covered : 0n;
+	const x = xOf(s); x.index = height; x.nav = p0; if (un > 0n) x.unbacked = N(un);
+}
+setIndexPrice((s) => indexPrice(s));
+/* If a coin in the reserve is hacked or shut down (24 Nov 2026), the chain can act without a new node:
+   validators vote (more than two thirds of the say, as for prices and deposits) with reserve.retire:
+   - 'out': the coin is leaving. Nobody buys DZY with it any more, and anyone may swap good coins INTO the reserve for it
+     (reserve.swap): what comes in is worth what goes out at the agreed prices, plus a fixed 0.5% for the trouble, so it
+     actually happens. The reserve trades a bad coin for good ones; no one is ever paid for nothing.
+   - 'zero': the coin counts for nothing in the price (a hack whose price feed still says otherwise); nobody buys with it.
+   - 'back': undoes either.
+   And on its own: a coin with no agreed price for a day counts for nothing, so DZY never freezes waiting for a dead feed.
+   A vote changes only which coins the reserve holds and how it counts them: it can never send a coin to anyone. */
+const RETIRE_BONUS_BP = 50n, GONE_MS = 86_400_000;
+export const retiredOf = (s: State, coin: string): 'out' | 'zero' | null => (s.x?.retired && own(s.x.retired, coin) ? s.x.retired[coin] : null);
+/** no agreed price for this coin for a day (or ever): it counts for nothing (only once the index is on) */
+function priceGone(s: State, coin: string, time: number) {
+	let last = 0;
+	for (const r of Object.values(s.x?.prices ?? {})) if (own(r.p, coin) && r.at > last) last = r.at;
+	return time - last > GONE_MS;
+}
+/* The fee from the trade itself (24 Nov 2026): once the index is on, buying, selling or taking a coin
+   out never needs DZY on the side for the chain's fee. The fee is still DZY, but it comes out of what is traded:
+   - selling DZY (a swap giving DZY) that would leave nothing for the fee: the fee comes out of the DZY sold;
+   - with less DZY than the fee, a trade in a coin (a swap giving a vault coin, x.sell, reserve.give) buys the missing
+     fee at the index price from that coin: the coin joins the reserve, the DZY come from the unsold, so the fee is backed
+     like any DZY bought. The amount traded shrinks by that much when it would not fit (a minimum shrinks with it).
+   Returns the data the transaction runs with, and how to undo what it did if the transaction is refused. */
+function feeFromTrade(s: State, tx: Tx, payer: string, fee: number): { data: Record<string, unknown>; undo: () => void } | null {
+	const d = tx.data, bal = balanceOf(s, payer, NATIVE);
+	const shrink = (amount: number, to: number) => ({ ...d, amount: to, ...(tx.type === 'swap' && isAmount(d.min) ? { min: Math.max(1, Math.floor((Number(d.min) * to) / amount)) } : {}) });
+	if (tx.type === 'swap' && d.give === NATIVE && isAmount(d.amount)) {
+		const amount = Number(d.amount);
+		return bal >= fee && bal - fee < amount && bal >= amount ? { data: shrink(amount, bal - fee), undo: () => {} } : null;
+	}
+	if (bal >= fee) return null;
+	const coin = tx.type === 'swap' ? (typeof d.give === 'string' && isXClaim(s, d.give) ? d.give.slice(1) : null) : (tx.type === 'x.sell' || tx.type === 'reserve.give') && typeof d.coin === 'string' && own(X_COINS, d.coin) ? d.coin : null;
+	if (!coin || !own(s.assets, 'x' + coin) || !isAmount(d.amount)) return null;
+	const need = fee - bal, p = indexPrice(s), price = xPrice(s, coin);
+	if (!p || !price || need > s.sun!.salePot) return null;
+	const units = N((B(need) * B(p) * 10n ** B(X_COINS[coin].decimals) + B(DZY) * B(price) - 1n) / (B(DZY) * B(price))); // rounded up: never less than the fee
+	const has = balanceOf(s, payer, 'x' + coin), amount = Number(d.amount);
+	if (units <= 0 || has < units || amount <= 0) return null;
+	sub(s, payer, 'x' + coin, units); s.assets['x' + coin].supply -= units; potAdd(s, coin, units);
+	s.sun!.salePot -= need; s.sun!.sold += need; add(s, payer, NATIVE, need);
+	const undo = () => { sub(s, payer, NATIVE, need); s.sun!.salePot += need; s.sun!.sold -= need; xOf(s).pot![coin] -= units; s.assets['x' + coin].supply += units; add(s, payer, 'x' + coin, units); };
+	return { data: amount + units > has ? shrink(amount, has - units) : d, undo };
+}
+/** what a hash key signs: for this chain, this account and this turn only */
+export const qMessage = (chain: string, account: string, n: number, d: { root: string; key?: string; only?: boolean; act?: unknown }) => 'dzy-q:' + canon({ chain, account, n, root: d.root, ...(d.key === undefined ? {} : { key: d.key }), ...(d.only === undefined ? {} : { only: d.only }), ...(d.act === undefined ? {} : { act: d.act }) });
+/** what a hash key may do as its account, in one step */
+const Q_ACTS: ReadonlySet<string> = new Set(['transfer', 'transfer.many', 'stake.unbond', 'stake.withdraw', 'stake.undelegate', 'stake.claim', 'offer.create', 'offer.cancel', 'swap', 'x.sell', 'x.close', 'key.add', 'key.remove', 'name.set', 'lock.stake']);
+/** stake that came from locks and is still held */
+export const keptNow = (s: State, st: Stake) => (st.kept ?? []).filter((k) => k.m > (s.sun?.minute ?? 0)).reduce((n, k) => n + k.n, 0);
+export const locksOfX = (s: State) => (s.heart ? s.xlocks : s.x?.locks);
+export const loansOfX = (s: State) => (s.heart ? s.xloans : s.x?.loans);
+export const lockAt = (s: State, k: string): number => { const m = locksOfX(s); return m && own(m, k) ? m[k] : 0; };
+function lockAdd(s: State, k: string, n: number) { const m = s.heart ? (s.xlocks ??= {}) : (xOf(s).locks ??= {}); m[k] = (m[k] ?? 0) + n; }
+export const isParked = (s: State, who: string): boolean => { const m = s.heart ? s.xparks : s.x?.park; return !!m && own(m, who); };
+/** as the upgrade starts: the lists of what is open already */
+function startLists(s: State) {
+	if (s.x) {
+		if (s.x.locks) { const m = s.x.locks; delete s.x.locks; for (const k of Object.keys(m)) (s.xlocks ??= {})[k] = m[k]; }
+		if (s.x.loans) { const m = s.x.loans; delete s.x.loans; for (const k of Object.keys(m)) (s.xloans ??= {})[k] = m[k]; }
+		if (s.x.park) { const m = s.x.park; delete s.x.park; for (const k of Object.keys(m)) (s.xparks ??= {})[k] = m[k]; }
+	}
+	for (const k of keysOf(s.offers)) bookAdd(s, k, s.time);
+	for (const k of keysOf(s.orders ?? {})) orderAdd(s, k);
 }
 /** how much of an offer `budget` (in what it wants) takes, at the maker's price rounded in the maker's favour; null if too small */
 function partFill(o: Offer, budget: number): { take: number; pay: number } | null {
@@ -663,7 +925,7 @@ function partFill(o: Offer, budget: number): { take: number; pay: number } | nul
 	return pay > budget || pay >= o.want.amount ? null : { take, pay };
 }
 /** what the taker of a fill receives: what the offer gives, less 0.05% to the pot if that is vault coin */
-const fillGets = (s: State, o: Offer, take: number) => take - (isXClaim(s, o.give.asset) ? xFee(take, RULES.xTradeBps) : 0);
+const fillGets = (s: State, o: Offer, take: number) => { const net = take - (isXClaim(s, o.give.asset) ? xFee(take, RULES.xTradeBps) : 0); return net - (royaltyIn(s.assets[o.want.asset], net)?.n ?? 0); }; // (less the royalty, when what is sold to the offer is an NFT)
 /** one fill of one offer: both sides move. A fill that moves vault coin pays 0.05% of that coin to the pot, once (on what
     the offer gives if it is coin). Checked before: the offer is open, the taker holds `pay`. */
 function fillOffer(s: State, key: string, taker: string, take: number, pay: number, height: number, time: number) {
@@ -671,11 +933,15 @@ function fillOffer(s: State, key: string, taker: string, take: number, pay: numb
 	const feeOn = isXClaim(s, o.give.asset) ? 'give' : isXClaim(s, o.want.asset) ? 'want' : null;
 	const fee = feeOn === 'give' ? xFee(take, RULES.xTradeBps) : feeOn === 'want' ? xFee(pay, RULES.xTradeBps) : 0;
 	sub(s, taker, o.want.asset, pay);
-	add(s, o.maker, o.want.asset, pay - (feeOn === 'want' ? fee : 0));
-	add(s, taker, o.give.asset, take - (feeOn === 'give' ? fee : 0));
-	if (fee) { const c = (feeOn === 'give' ? o.give.asset : o.want.asset).slice(1); s.assets['x' + c].supply -= fee; potAdd(s, c, fee); }
+	const toMaker = pay - (feeOn === 'want' ? fee : 0), toTaker = take - (feeOn === 'give' ? fee : 0);
+	const r1 = royaltyIn(s.assets[o.give.asset], toMaker), r2 = royaltyIn(s.assets[o.want.asset], toTaker); // an NFT sold, to a buyer or to an offer for it: its maker's royalty comes out of what the seller gets
+	if (toMaker - (r1?.n ?? 0) > 0) add(s, o.maker, o.want.asset, toMaker - (r1?.n ?? 0));
+	if (r1) add(s, r1.to, o.want.asset, r1.n);
+	if (toTaker - (r2?.n ?? 0) > 0) add(s, taker, o.give.asset, toTaker - (r2?.n ?? 0));
+	if (r2) add(s, r2.to, o.give.asset, r2.n);
+	if (fee) { const c = (feeOn === 'give' ? o.give.asset : o.want.asset).slice(1); s.assets['x' + c].supply -= fee; potAdd(s, c, coinFee(s, c, fee)); }
 	const sold = o.give.asset, paid = o.want.asset;
-	if (take === o.give.amount) delete s.offers[key];
+	if (take === o.give.amount) { bookDrop(s, o, key); delete s.offers[key]; }
 	else { o.give = { asset: sold, amount: o.give.amount - take }; o.want = { asset: paid, amount: o.want.amount - pay }; }
 	const t: Trade = { h: height, t: time, offer: key, maker: o.maker, taker, sold: { asset: sold, amount: take }, paid: { asset: paid, amount: pay } };
 	s.trades = [...(s.trades ?? []), t].slice(-RULES.maxTrades);
@@ -717,22 +983,43 @@ function xLeg(s: State, give: string, want: string, amount: number, time: number
 	const u = s.sun!;
 	if (isXClaim(s, give) && want === NATIVE) {
 		const coin = give.slice(1), price = xPrice(s, coin, time);
-		if (price === null || u.salePot <= 0) return null;
-		const usd = (B(amount) * B(price)) / 10n ** B(X_COINS[coin].decimals), units = N(saleUnitsFor(V2, B(u.sold), usd));
+		if (price === null || u.salePot <= 0 || retiredOf(s, coin)) return null; // (a retired coin buys no DZY)
+		const usd = (B(amount) * B(price)) / 10n ** B(X_COINS[coin].decimals), units = indexOn(s) ? indexBuyUnits(s, usd, time) : N(unitsFor(s, usd, xFloor(s, time)));
 		if (units <= 0 || units > u.salePot) return null;
 		return { out: units, run: (who) => {
 			sub(s, who, give, amount); s.assets[give].supply -= amount;
-			const x = xOf(s); (x.locks ??= {})[`${who}:${coin}`] = (x.locks[`${who}:${coin}`] ?? 0) + amount;
+			if (indexOn(s)) indexBought(s, usd, time);
+			if (indexOn(s) || reserveOn(s)) potAdd(s, coin, amount); else lockAdd(s, `${who}:${coin}`, amount); // the shared reserve (before it: a lock in their name)
 			u.salePot -= units; u.sold += units; add(s, who, NATIVE, units);
+		} };
+	}
+	if (give === NATIVE && isXClaim(s, want) && indexOn(s)) { // the index: what stands behind each DZY, less the fee that stays
+		const coin = want.slice(1), pot = s.x?.pot?.[coin] ?? 0, q = indexSale(s, coin, amount, time);
+		if (!q || q.pay > pot) return null; // only what the reserve holds of that coin
+		return { out: q.pay, run: (who) => {
+			const n = indexNav(s, time); if (n) wash(s, n, B(q.fee), WASH_BP);
+			sub(s, who, NATIVE, amount); u.salePot += amount; u.sold -= amount;
+			xOf(s).pot![coin] -= q.pay; claimAsset(s, coin).supply += q.pay; claimAsset(s, coin).minted += q.pay; add(s, who, want, q.pay);
+		} };
+	}
+	if (give === NATIVE && isXClaim(s, want) && indexWaiting(s)) return null; // the reserve is short of today's price: no selling into it yet
+	if (give === NATIVE && isXClaim(s, want) && reserveOn(s)) { // the shared reserve: the chain's price, nothing added or taken
+		const coin = want.slice(1), pot = s.x?.pot?.[coin] ?? 0, q = reserveSale(s, coin, amount, time);
+		if (!q || q.pay > pot) return null; // only what the reserve holds of that coin
+		return { out: q.pay, run: (who) => {
+			sub(s, who, NATIVE, amount); u.salePot += amount; u.sold -= amount;
+			xOf(s).pot![coin] -= q.pay; claimAsset(s, coin).supply += q.pay; claimAsset(s, coin).minted += q.pay; add(s, who, want, q.pay);
 		} };
 	}
 	if (give === NATIVE && isXClaim(s, want)) {
 		const coin = want.slice(1), pot = s.x?.pot?.[coin] ?? 0, f = pot ? xFloor(s, time) : null, price = f ? xPrice(s, coin, time) : null;
 		if (!f || price === null || amount > u.sold) return null;
-		const pay = N((B(amount) * f.usd * 10n ** B(X_COINS[coin].decimals)) / (f.hands * B(price)));
-		if (pay <= 0 || pay > pot) return null;
+		const gross = N((B(amount) * f.usd * 10n ** B(X_COINS[coin].decimals)) / (f.hands * B(price)));
+		if (gross <= 0 || gross > pot) return null;
+		let t: ReturnType<typeof takeBacking>; try { t = takeBacking(s, coin, pot, gross); } catch { return null; } // the day's part is used up
+		const pay = t.pay;
 		return { out: pay, run: (who) => {
-			sub(s, who, NATIVE, amount); u.salePot += amount; u.sold -= amount;
+			t.done(); sub(s, who, NATIVE, amount); u.salePot += amount; u.sold -= amount;
 			xOf(s).pot![coin] -= pay; claimAsset(s, coin).supply += pay; claimAsset(s, coin).minted += pay; add(s, who, want, pay);
 		} };
 	}
@@ -771,25 +1058,38 @@ function sideOf(s: State, v: unknown): Side {
    so a refused transaction leaves no trace. */
 /** what a handler may know beyond the transaction (worked out before, while waiting is still allowed), and what it
     reports back (the gas a contract used, so the unused part of the fee is given back) */
-interface Ctx { height: number; payer: string; contract?: string; sigsOk?: boolean; gasUsed?: number; failed?: string; secretHash?: string; linkOk?: boolean; giftOk?: boolean; taskOk?: boolean }
+interface Ctx { height: number; payer: string; contract?: string; sigsOk?: boolean; gasUsed?: number; failed?: string; secretHash?: string; linkOk?: boolean; giftOk?: boolean; taskOk?: boolean; stepSig?: boolean; side?: string; fee?: number }
 /** what applyTx can report back: the fee paid, the gas a contract used, and why a contract call failed while running */
 export interface TxReport { fee?: number; gasUsed?: number; failed?: string }
 type Handler = (s: State, from: string, d: Record<string, unknown>, id: string, time: number, ctx: Ctx) => () => void;
 
+/** what layers may do with balances: the ledger's own moves and checks, nothing more */
+const bankOf = (s: State): Bank => ({
+	add: (who, asset, n) => add(s, who, asset, n), sub: (who, asset, n) => sub(s, who, asset, n), balance: (who, asset) => balanceOf(s, who, asset), toSun: (n) => toTreasury(s, n),
+	asset: (id) => (typeof id === 'string' && own(s.assets, id) ? id : fail('no such asset')), amount: amountOf, addr: (v) => (isAddr(v) ? v : fail('bad address')),
+});
+const blobBank = (s: State): BlobBank => ({
+	...bankOf(s), assetFee: RULES.assetFee, toFees: (n) => { s.sun!.feePot += n; }, // into the fee pot: 40% validators, 30% backing, ... like any fee
+	keptTimes: () => keptTimes(s), keptAdd: (n) => keptAdd(s, n), dzyFor: (usd) => usdCost(s, NATIVE, usd) ?? fail('DZY has no price'), staked: (who) => isCandidate(s, who),
+});
 /** milliseconds since block 1 (0 before the chain has started) */
 const elapsed = (s: State, time: number) => (s.started ? Math.max(0, time - s.started) : 0);
 /** an account that already exists; key and recovery changes need one, so they cannot be used to fill the chain with empty accounts */
 const existing = (s: State, addr: string): Account => (own(s.accounts, addr) ? s.accounts[addr] : fail('this account has nothing on the chain yet'));
 
 /** the 0.5% (saleFeeBps) taken from a tip or a sale, rounded down */
-const saleFee = (amount: number) => Number((BigInt(amount) * BigInt(RULES.saleFeeBps)) / 10_000n);
+const saleFee = (amount: number, bps: number = RULES.saleFeeBps) => Number((BigInt(amount) * BigInt(bps)) / 10_000n);
+/** the most the creators' fee can ever be set to: 20% (fee.set) */
+export const SALE_FEE_MAX_BPS = 2_000;
+/** the creators' fee now: what the network's fee account set (fee.set), from the checkout upgrade; else the rule */
+export const feeBpsOf = (s: State) => (checkoutV2(s) && Number.isSafeInteger(s.saleFeeBps) ? s.saleFeeBps! : RULES.saleFeeBps);
 /* ---- dollar prices: a creator prices in dollars (µ$), a buyer pays in any coin the chain prices ----
    DZY at the chain's own sale price; xUSDC and xUSDT (claims on dollars in the vaults) one for one; the other claims
    (xETH, xBTC, xSOL, ...) at the price the validators agreed (xPrice). Nothing else: a coin with no price is refused. */
 export const DOLLAR_CLAIMS: readonly string[] = ['xUSDC', 'xUSDT'];
 /** µ$ per whole unit of `asset` now, and its decimals; null when the chain has no price for it */
 export function usdRate(s: State, asset: string, time: number = s.time): { per: number; decimals: number } | null {
-	if (asset === NATIVE) return s.sun ? { per: N(salePrice(V2, B(s.sun.sold))), decimals: 8 } : null;
+	if (asset === NATIVE) return s.sun ? { per: payPrice(s), decimals: 8 } : null;
 	if (!own(s.assets, asset)) return null;
 	if (DOLLAR_CLAIMS.includes(asset)) return { per: 1_000_000, decimals: 6 };
 	const coin = asset.startsWith('x') ? asset.slice(1) : '';
@@ -828,18 +1128,225 @@ export function itemOf(v: unknown): { price: number; asset: string; usd: number;
    validators read it on that chain and report it (order.attest). When more than two thirds of the say agree, the buyer
    owns the item, exactly as with item.buy. The money never touches Dznye: the creator has it at once. The 0.5% is owed
    by the creator (feeOwed) and taken from their next earnings on Dznye; past feeOwedMax, no new orders. */
-export interface Order { buyer: string; seller: string; item: string; net: string; coin: string; payTo: string; base: number; due: number; usd: number; memo: string; at: number; until: number; tx?: string; votes?: string[] }
+export interface Order { buyer: string; seller: string; item: string; net: string; coin: string; payTo: string; base: number; due: number; usd: number; memo: string; at: number; until: number; tx?: string; votes?: string[]; /** paid into Dznye's vault: the chain pays the creator */ vault?: true; /** a network's own coin: paid by the vault's deposit naming this tag */ tag?: string }
 /** which coin on which network a buyer may pay with (all counted on Dznye in its units: 6 decimals, 9 for SOL/ETH/BNB) */
 export const ORDER_COINS: Readonly<Record<string, readonly string[]>> = Object.freeze({
 	USDC: ['base', 'sol', 'bsc', 'eth', 'arb', 'op', 'polygon', 'avax'], USDT: ['bsc', 'sol', 'eth', 'arb', 'op', 'polygon', 'avax'],
-	SOL: ['sol'], ETH: ['base', 'eth', 'arb', 'op'], BNB: ['bsc'],
+	SOL: ['sol'], ETH: ['base', 'eth', 'arb', 'op'], BNB: ['bsc'], POL: ['polygon'], AVAX: ['avax'],
 });
-const ORDER_DECIMALS: Readonly<Record<string, number>> = Object.freeze({ USDC: 6, USDT: 6, SOL: 9, ETH: 9, BNB: 9 });
+const ORDER_DECIMALS: Readonly<Record<string, number>> = Object.freeze({ USDC: 6, USDT: 6, SOL: 9, ETH: 9, BNB: 9, POL: 9, AVAX: 9, BTC: 8 });
+/* Bitcoin at checkout (24 Nov 2026; off until a block is set). A buyer pays the creator's own Bitcoin
+   address (the one their account linked) an exact amount in satoshis, unique among the creator's open checkouts; the
+   validators count it only with its proof: its merkle path to a block whose headers carry the work and are buried deep
+   enough (btc.ts checkBtcPayment). As with every payment made straight to a creator on another chain, the creators' fee
+   goes on their tab (feeOwed) and is taken from their next earnings on Dznye. */
+const ORDER_BTC_FROM: Record<string, number> = { 'dznye-mainnet': 11_100 }; // switched on 24 Nov 2026
+const TEST_ORDER_BTC = new Map<string, number>();
+/** TEST ONLY: the block a test chain takes Bitcoin at checkout from (null: back to the rule) */
+export function testOrderBtcFrom(chain: string, height: number | null) { if (height === null) TEST_ORDER_BTC.delete(chain); else TEST_ORDER_BTC.set(chain, height); }
+export const orderBtcFrom = (chain: string) => TEST_ORDER_BTC.get(chain) ?? (Object.hasOwn(ORDER_BTC_FROM, chain) ? ORDER_BTC_FROM[chain] : Infinity);
+export const orderBtcOn = (s: State, height: number = s.height + 1) => height >= orderBtcFrom(s.chain);
+/** a network's own coin: the vault takes it only through its deposit, which names a 32-byte tag (an order's) */
+const NATIVE_PAY = new Set(['ETH', 'BNB', 'POL', 'AVAX']);
 /** where the creator is paid on `net`: their Solana address (their own key) or a linked one; on the 0x networks, the 0x
     address they linked to their name. null: they cannot be paid there yet */
+/* Checkout through the vaults, and creators who join (2026-11-21). From this block on mainnet:
+   - an outside checkout is paid into Dznye's own vault on that chain (USDC or USDT, on every network with a vault), not to
+     the creator. When the validators agree it arrived, the creator gets 99.5% of it as that coin on Dznye (theirs to keep,
+     spend or take out to any chain) and the network's fee account the 0.5%, in the same coin, at once: no fee is owed.
+     ETH and BNB sent as a plain payment (the vault takes those only through its deposit) are not offered; Solana, with
+     no vault yet, keeps the old checkout (paid to the creator, the fee on their tab);
+   - selling (item.buy, a checkout) needs the seller to have joined (creator.join, free to do): joining puts $5 on what
+     they owe, taken from their first sales and tips, like any fee owed.
+   Blocks before it replay under the rules as they were. Other chains keep the old checkout. */
+const CHECKOUT_V2_FROM: Record<string, number> = { 'dznye-mainnet': 7400 };
+const TEST_CHECKOUT_V2 = new Map<string, number>();
+/** TEST ONLY: the block a test chain starts the vault checkout from (null: back to the rule) */
+export function testCheckoutV2From(chain: string, height: number | null) { if (height === null) TEST_CHECKOUT_V2.delete(chain); else TEST_CHECKOUT_V2.set(chain, height); }
+export const checkoutV2 = (s: State, height: number = s.height + 1) => height >= (TEST_CHECKOUT_V2.get(s.chain) ?? (Object.hasOwn(CHECKOUT_V2_FROM, s.chain) ? CHECKOUT_V2_FROM[s.chain] : Infinity));
+/** the one-time price of joining as a creator, in µ$ */
+export const CREATOR_JOIN_USD = 5_000_000;
+/* A shop's 40 free days (24 Nov 2026; from the block below). A shop opened from then on owes its $5
+   only once 40 days have passed: until then every sale is the creator's in full (less the creators' fee). From day 40
+   the $5 is taken from the next sales, in whatever coin they are paid in, as before; or the creator pays it any time,
+   in any coin the chain prices (fee.pay). It goes to the network's fee account, like the creators' fee. */
+export const JOIN_TRIAL_MS = 40 * 86_400_000;
+const JOIN_TRIAL_FROM: Record<string, number> = { 'dznye-mainnet': 11_100 };
+const TEST_JOIN_TRIAL = new Map<string, number>();
+/** TEST ONLY: the block a test chain gives shops their free days from (null: back to the rule) */
+export function testJoinTrialFrom(chain: string, height: number | null) { if (height === null) TEST_JOIN_TRIAL.delete(chain); else TEST_JOIN_TRIAL.set(chain, height); }
+export const joinTrialOn = (s: State, height: number = s.height + 1) => height >= (TEST_JOIN_TRIAL.get(s.chain) ?? (Object.hasOwn(JOIN_TRIAL_FROM, s.chain) ? JOIN_TRIAL_FROM[s.chain] : Infinity));
+/** the $5 a shop owes from `time` on (its free days over, not yet paid), in µ$ */
+export const joinDueAt = (s: State, who: string, time: number = s.time) => (s.joinDue && own(s.joinDue, who) && time >= s.joinDue[who] ? CREATOR_JOIN_USD : 0);
+/** whether `a` may sell: always before the upgrade; after it, once they have joined */
+export const creatorJoined = (s: State, a: string, height: number = s.height + 1) => !checkoutV2(s, height) || !!(s.creators && own(s.creators, a));
+/* Resale (22 Nov 2026). Whoever owns a numbered edition may offer it for dollars. The price is all a
+   buyer pays: the resale fee comes out of it. The fee is the creator's to set on the item (`resale`, 1% to 10%; 2% when
+   they set none): 70% of it goes to the creator, 30% to the network's fee account (@dzy). Only numbered editions: a file sold
+   without limit is copied, not owned. Older blocks replay as they were; other chains: from the start, unless set. */
+const RESALE_FROM: Record<string, number> = { 'dznye-mainnet': 10_000 }; // live height 7,977 when written, 22 Nov 2026
+const TEST_RESALE = new Map<string, number>();
+/** TEST ONLY: the block a test chain takes resales from (null: back to the rule) */
+export function testResaleFrom(chain: string, height: number | null) { if (height === null) TEST_RESALE.delete(chain); else TEST_RESALE.set(chain, height); }
+export const resaleFrom = (chain: string) => TEST_RESALE.get(chain) ?? (Object.hasOwn(RESALE_FROM, chain) ? RESALE_FROM[chain] : 0);
+export const resaleOn = (s: State, height: number = s.height + 1) => height >= resaleFrom(s.chain);
+export const RESALE = Object.freeze({ defaultBps: 200, minBps: 100, maxBps: 1_000, creatorPct: 70, minUsd: 100_000, maxUsd: 1_000_000_000_000 });
+/** Sold means locked (from the same block): once an item has sold, its maker may change only what it costs, its words
+    (about), its resale fee and whether it is on sale, and may make fewer of them (never fewer than sold); never what it
+    is: its title, picture, kind, locked content, or any other field. It cannot be deleted. A membership may change what
+    it gives (a private link, an invite): that is paid for month by month; it cannot be deleted either. The reason it is refused, or ''. */
+const ITEM_FREE: ReadonlySet<string> = new Set(['usd', 'price', 'asset', 'about', 'resale', 'off', 'editions']);
+/** A file an item opens into costs by its size, once, to the Sun with the record's own fee: the same for a kilobyte as for a
+    character of a record (0.00001 DZY; 10 MB is 0.1 DZY). Nothing else is charged for posting. A price change pays it again
+    never: only a new file does. */
+export const FILE_FEE = Object.freeze({ perKb: 1_000, max: 60_000_000 });
+export const fileFee = (bytes: number) => Math.ceil(bytes / 1_000) * FILE_FEE.perKb;
+export function itemFileFee(s: State, writer: string, item: string, value: unknown): number {
+	const v = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+	if (v.file === undefined && v.fs === undefined) return 0;
+	if (typeof v.file !== 'string' || !/^[0-9a-f]{64}$/.test(v.file) || !Number.isSafeInteger(v.fs) || (v.fs as number) < 1 || (v.fs as number) > FILE_FEE.max) fail('file: its fingerprint, and fs: its size, at most 60 MB');
+	const rec = s.records && own(s.records, `${writer}/items/${item}`) ? s.records[`${writer}/items/${item}`].value : null, o = rec && typeof rec === 'object' ? (rec as Record<string, unknown>) : {};
+	return o.file === v.file && o.fs === v.fs ? 0 : fileFee(v.fs as number);
+}
+const soldCount = (s: State, seller: string, item: string) => (s.sales && own(s.sales, `${seller}/${item}`) ? s.sales[`${seller}/${item}`].n : 0);
+export function soldLock(s: State, seller: string, item: string, next: unknown): string {
+	const sold = soldCount(s, seller, item);
+	const rec = s.records && own(s.records, `${seller}/items/${item}`) ? s.records[`${seller}/items/${item}`] : null;
+	if (!sold || !rec || rec.value === undefined) return '';
+	if (next === null || typeof next !== 'object' || Array.isArray(next)) return 'someone owns this: it cannot be removed (hide it instead)';
+	const a = rec.value as Record<string, unknown>, b = next as Record<string, unknown>, month = a.every === 'month';
+	for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+		if (ITEM_FREE.has(k) || (month && k !== 'every')) continue;
+		if (own(a, k) !== own(b, k) || canon(a[k] ?? null) !== canon(b[k] ?? null)) return `someone owns this: its ${k === 'sealed' ? 'content' : k === 'cover' ? 'picture' : k} cannot change any more`;
+	}
+	if (own(a, 'editions') !== own(b, 'editions') || (own(a, 'editions') && !(Number.isSafeInteger(b.editions) && (b.editions as number) <= (a.editions as number) && (b.editions as number) >= sold))) return 'someone owns this: you may make fewer of them (never fewer than sold), not more';
+	return '';
+}
+/* Cards that are real NFTs (23 Nov 2026; off until a block is set). An item may name the Heart NFT
+   (`nft`) its creator made of it: the copies must be theirs and as many as its editions. From the block below, buying it
+   through the shop (item.buy, or a checkout paid from any chain) hands the buyer one copy in the same step; a resale moves
+   the owner's copy; and whoever holds a copy, however they got it, owns the item (GET /owned). A creator who no longer holds a
+   copy cannot sell one: a checkout already paid then gives the buyer their money back, on Dznye. */
+const NFT_ITEMS_FROM: Record<string, number> = { 'dznye-mainnet': 11_100 }; // switched on 24 Nov 2026
+const TEST_NFT_ITEMS = new Map<string, number>();
+/** TEST ONLY: the block a test chain links items to NFTs from (null: back to the rule) */
+export function testNftItemsFrom(chain: string, height: number | null) { if (height === null) TEST_NFT_ITEMS.delete(chain); else TEST_NFT_ITEMS.set(chain, height); }
+export const nftItemsFrom = (chain: string) => TEST_NFT_ITEMS.get(chain) ?? (Object.hasOwn(NFT_ITEMS_FROM, chain) ? NFT_ITEMS_FROM[chain] : Infinity);
+export const nftItemsOn = (s: State, height: number = s.height + 1) => !!s.heart && height >= nftItemsFrom(s.chain);
+/** the NFT an item is, when the rule is on and it names one, or null */
+export function itemNft(s: State, value: unknown, height: number = s.height + 1): string | null {
+	if (!nftItemsOn(s, height) || !value || typeof value !== 'object') return null;
+	const n = (value as Record<string, unknown>).nft;
+	return typeof n === 'string' && own(s.assets, n) && s.assets[n].nft ? n : null;
+}
+/** an item record naming an NFT must name its writer's own, with as many copies as editions: the reason it is refused, or '' */
+function nftItemProblem(s: State, writer: string, value: unknown): string {
+	const v = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+	if (!v || v.nft === undefined) return '';
+	const a = typeof v.nft === 'string' && own(s.assets, v.nft) ? s.assets[v.nft] : null;
+	if (!a?.nft) return 'nft: an NFT on this chain';
+	if (a.nft.by !== writer) return 'nft: only one you made yourself';
+	if (v.every !== undefined || a.minted !== v.editions) return 'nft: as many editions as it has copies, and not a membership';
+	return '';
+}
+/* DZY on Solana (23 Nov 2026; off until a block and the token are set). Anyone may move DZY they own to
+   Solana and back. Going out, their DZY is held by the chain (State.wdzy.held: never destroyed, never the Sun's or the
+   sale's) and the Solana vault pays them the same amount of wDZY, released only with the validators' signatures, exactly as
+   it pays SOL or USDC. Coming back, they pay wDZY into the vault; once validators with more than two thirds of the power
+   have seen it, the same DZY is theirs again. The wDZY token has a fixed supply of 12,000,000 that all starts in the vault
+   and can never be made again (its mint authority is closed), so wDZY in people's hands is exactly the DZY held here. At
+   most `cap` DZY are out at once, so a fault costs little while it is new. */
+export const WDZY = Object.freeze({ cap: 100_000 * DZY, least: DZY / 100 });
+const WDZY_FROM: Record<string, number> = {}; // the owner writes the mainnet block here: 'dznye-mainnet': N
+const WDZY_MINT: Record<string, string> = {}; // and the wDZY token's mint address on Solana
+const TEST_WDZY = new Map<string, { from: number; mint: string; cap?: number }>();
+/** TEST ONLY: switch DZY on Solana on for a test chain (null: back to the rule) */
+export function testWdzy(chain: string, v: { from: number; mint: string; cap?: number } | null) { if (v === null) TEST_WDZY.delete(chain); else TEST_WDZY.set(chain, v); }
+const wdzyConf = (chain: string) => TEST_WDZY.get(chain) ?? (Object.hasOwn(WDZY_FROM, chain) && Object.hasOwn(WDZY_MINT, chain) ? { from: WDZY_FROM[chain], mint: WDZY_MINT[chain] } : null);
+/** the wDZY token's mint on Solana, or null while DZY on Solana is off */
+export const wdzyMint = (chain: string): string | null => wdzyConf(chain)?.mint ?? null;
+const wdzyCap = (chain: string) => TEST_WDZY.get(chain)?.cap ?? WDZY.cap;
+export const wdzyOn = (s: State, height: number = s.height + 1) => { const c = wdzyConf(s.chain); return !!c && height >= c.from && exchangeOn(s, height); };
+/** a validator's word that wDZY came back into the Solana vault: counted like any deposit (more than two thirds of the
+    power), then the same DZY is its owner's again, from what the chain holds */
+function wdzyIn(s: State, from: string, d: Record<string, unknown>, time: number) {
+	if (!wdzyOn(s)) fail('DZY on Solana is not open on this chain');
+	if (d.net !== 'sol') fail('wDZY comes back through the Solana vault');
+	const amount = amountOf(d.amount), to = isAddr(d.to) ? d.to : fail('bad Dznye address');
+	const tx = typeof d.tx === 'string' && d.tx.length >= 32 && d.tx.length <= 100 && /^[0-9A-Za-z]+$/.test(d.tx) ? d.tx : fail('bad payment id');
+	const seen = `sol:${tx}`;
+	if (s.xseen && own(s.xseen, seen)) fail('that payment was already counted');
+	const key = `${seen}:wDZY:${amount}:${to}`, c = s.xclaims && own(s.xclaims, key) ? s.xclaims[key] : null;
+	if (c?.votes.includes(from)) fail('this validator already confirmed it');
+	const votes = [...(c?.votes ?? []), from], w = powers(s);
+	const said = votes.reduce((n, v) => n + (w[v] ?? 0), 0), all = Object.values(w).reduce((n, v) => n + v, 0);
+	if (said * 3 <= all * 2 || !vouched(s, votes)) return () => { (s.xclaims ??= {})[key] = { at: time, votes }; };
+	const held = s.wdzy?.held ?? 0;
+	if (amount > held) fail('more wDZY came back than was ever sent out'); // cannot happen while the supply is the vault's
+	return () => { s.wdzy!.held -= amount; add(s, to, NATIVE, amount); (s.xseen ??= {})[seen] = { at: time, to, coin: 'wDZY', amount, dzy: amount }; dropClaims(s, seen); };
+}
+/* Business (23 Nov 2026; off until a block is set). An item may be a business offer (`biz`: 'order' a
+   product or a meal, 'book' an appointment or a session, 'table' a reservation, 'pass' a pass or a membership of a place).
+   It can be bought again and again, and a purchase may carry a short note (an address, a size, what to bring). An
+   appointment or a reservation names its hours (`book`: the days of the week, from and to in minutes of the day, the
+   length of a slot, the seats in a slot, and the business's time zone in minutes); buying it names the slot (`at`), and
+   the chain refuses a slot that is not open, is past or too far ahead, or is full. The business sees every order and
+   booking (GET /biz/<address>); anyone sees how full each slot is (GET /slots/<seller>/<item>). */
+export const BIZ = Object.freeze({ kinds: ['order', 'book', 'table', 'pass'] as readonly string[], noteMax: 140, aheadMs: 180 * 86_400_000, keep: 400, seatsMax: 500 });
+const BIZ_FROM: Record<string, number> = { 'dznye-mainnet': 11_100 }; // switched on 24 Nov 2026
+const TEST_BIZ = new Map<string, number>();
+/** TEST ONLY: the block a test chain opens business offers from (null: back to the rule) */
+export function testBizFrom(chain: string, height: number | null) { if (height === null) TEST_BIZ.delete(chain); else TEST_BIZ.set(chain, height); }
+export const bizFrom = (chain: string) => TEST_BIZ.get(chain) ?? (Object.hasOwn(BIZ_FROM, chain) ? BIZ_FROM[chain] : Infinity);
+export const bizOn = (s: State, height: number = s.height + 1) => height >= bizFrom(s.chain);
+export interface Book { days: number[]; from: number; to: number; step: number; seats: number; tz: number }
+export interface BizEntry { i: string; by: string; t: number; asset: string; paid: number; at?: number; note?: string }
+/** a booking offer's hours, or null when they are not well made */
+export function bookOf(v: unknown): Book | null {
+	const b = v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+	if (!b) return null;
+	const int = (x: unknown, lo: number, hi: number) => Number.isSafeInteger(x) && (x as number) >= lo && (x as number) <= hi;
+	const days = Array.isArray(b.days) && b.days.length >= 1 && b.days.length <= 7 && b.days.every((d) => int(d, 0, 6)) && new Set(b.days).size === b.days.length ? (b.days as number[]) : null;
+	if (!days || !int(b.from, 0, 1439) || !int(b.to, 1, 1440) || (b.to as number) <= (b.from as number) || !int(b.step, 5, 720) || !int(b.seats, 1, BIZ.seatsMax) || !int(b.tz, -840, 840)) return null;
+	return { days, from: b.from as number, to: b.to as number, step: b.step as number, seats: b.seats as number, tz: b.tz as number };
+}
+/** why `at` (ms) is not an open slot of `b` at `now`, or '' */
+export function slotProblem(b: Book, at: unknown, now: number): string {
+	if (!Number.isSafeInteger(at) || (at as number) % 60_000) return 'at: the slot, in whole minutes';
+	const t = at as number;
+	if (t <= now) return 'that time has passed';
+	if (t > now + BIZ.aheadMs) return 'too far ahead';
+	const local = t + b.tz * 60_000, day = new Date(local).getUTCDay(), m = Math.floor((local % 86_400_000 + 86_400_000) % 86_400_000 / 60_000);
+	if (!b.days.includes(day)) return 'closed that day';
+	if (m < b.from || m + b.step > b.to || (m - b.from) % b.step) return 'not one of the open times';
+	return '';
+}
+/** an item record's business part: the reason it is refused, or '' */
+function bizProblem(value: unknown): string {
+	const v = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+	if (!v || v.biz === undefined) return '';
+	if (typeof v.biz !== 'string' || !BIZ.kinds.includes(v.biz)) return `biz: one of ${BIZ.kinds.join(', ')}`;
+	if ((v.biz === 'book' || v.biz === 'table') !== (v.book !== undefined)) return 'book: the hours of an appointment or a reservation (and only of those)';
+	if (v.book !== undefined && !bookOf(v.book)) return 'book: days 0 to 6, from and to in minutes of the day, step, seats and tz';
+	if (v.every !== undefined && v.biz !== 'pass') return 'only a pass may be monthly';
+	return '';
+}
+/** an item's resale fee in basis points: what its creator set, within the limits; else the default */
+export function resaleBps(v: unknown): number {
+	const n = v && typeof v === 'object' ? (v as Record<string, unknown>).resale : undefined;
+	return Number.isSafeInteger(n) && (n as number) >= RESALE.minBps && (n as number) <= RESALE.maxBps ? (n as number) : RESALE.defaultBps;
+}
+/** a resale's price split, in whole units: every unit goes to someone */
+export function resaleSplit(pay: number, bps: number): { owner: number; creator: number; founder: number } {
+	const fee = saleFee(pay, bps), creator = N((B(fee) * B(RESALE.creatorPct)) / 100n);
+	return { owner: pay - fee, creator, founder: fee - creator };
+}
+/** the vault an outside checkout in `coin` on `net` is paid into, or null when none takes it */
+export const checkoutVault = (s: State, coin: string, net: string): string | null => ((coin === 'USDC' || coin === 'USDT' || NATIVE_PAY.has(coin)) && exchangeOn(s) && xLive(s, coin, net) ? exchangeVaults(s)[net] ?? null : null);
 export function payToOf(s: State, seller: string, net: string): string | null {
 	const links = own(s.accounts, seller) ? s.accounts[seller].links ?? {} : {};
 	if (net === 'sol') return links.sol ?? toBase58(seller);
+	if (net === 'btc') return links.btc ?? null; // Bitcoin at checkout: the address the creator linked
 	return links.eth ?? null;
 }
 /** what `usd` µ$ is in `coin` (its Dznye units) now: dollar coins one for one, the others at the validators' price */
@@ -848,17 +1355,54 @@ export function orderBase(s: State, coin: string, usd: number, time: number = s.
 	const p = xPrice(s, coin, time); if (!p) return null;
 	return N((B(usd) * 10n ** B(ORDER_DECIMALS[coin]) + B(p) - 1n) / B(p));
 }
+/** a checkout paid: the buyer owns the item; paid into a vault, the creator gets the coin on Dznye less the fee (and
+    anything owed), the fee account the fee, at once; paid to the creator, the fee goes on their tab */
+function completeOrder(s: State, key: string, amount: number, time: number, seen: string) {
+	const o = s.orders![key];
+	const rec = s.records && own(s.records, `${o.seller}/items/${o.item}`) ? s.records[`${o.seller}/items/${o.item}`] : null, v = itemOf(rec?.value);
+	const k = `${o.buyer}/${o.seller}/${o.item}`, had = s.owned && own(s.owned, k) ? s.owned[k] : null;
+	(s.xseen ??= {})[seen] = { at: time, to: o.seller, coin: o.coin, amount, dzy: 0 };
+	const card = o.vault ? itemNft(s, rec?.value) : null;
+	if (card && balanceOf(s, o.seller, card) < 1) { // the creator let every copy go before this was paid: the buyer gets the money back, on Dznye
+		const asset = 'x' + o.coin, x = xOf(s); x.vaults[`${o.net}:${o.coin}`] = (x.vaults[`${o.net}:${o.coin}`] ?? 0) + amount;
+		claimAsset(s, o.coin).supply += amount; claimAsset(s, o.coin).minted += amount; add(s, o.buyer, asset, amount);
+		orderDrop(s, key); return;
+	}
+	if (card) { sub(s, o.seller, card, 1); add(s, o.buyer, card, 1); }
+	const sold = s.sales && own(s.sales, `${o.seller}/${o.item}`) ? s.sales[`${o.seller}/${o.item}`].n : 0;
+	(s.owned ??= {})[k] = { at: time, asset: `${o.coin}@${o.net}`, paid: amount, usd: o.usd, ...(v?.month ? { until: Math.max(time, had?.until ?? 0) + MONTH_MS } : {}), ...(edOn(s) ? (v?.editions && !had ? { ed: sold + 1 } : had?.ed ? { ed: had.ed } : {}) : {}) };
+	const x0 = ((s.sales ??= {})[`${o.seller}/${o.item}`] ??= { n: 0, total: 0 }); x0.n += 1; x0.usd = (x0.usd ?? 0) + o.usd;
+	if (o.vault) {
+		const asset = 'x' + o.coin, x = xOf(s); x.vaults[`${o.net}:${o.coin}`] = (x.vaults[`${o.net}:${o.coin}`] ?? 0) + amount;
+		claimAsset(s, o.coin).supply += amount; claimAsset(s, o.coin).minted += amount;
+		const fee = saleFee(amount, feeBpsOf(s)), back = collectOwed(s, o.seller, asset, amount - fee)();
+		add(s, o.seller, asset, amount - fee - back); if (fee + back) add(s, RULES.saleFeeTo, asset, fee + back);
+	} else (s.feeOwed ??= {})[o.seller] = feeOwedOf(s, o.seller) + saleFee(o.usd, feeBpsOf(s));
+	orderDrop(s, key);
+}
+/** the open, tagged checkout a vault deposit names (its `to`), or null */
+function taggedOrder(s: State, to: string, coin: string, net: string, time: number): string | null {
+	if (s.heart) { const k = 'o' + to.slice(0, 16), o = s.orders && own(s.orders, k) ? s.orders[k] : null; return o && o.tag === to && o.coin === coin && o.net === net && orderOpen(o, time) ? k : null; } // a checkout's key is the start of its tag
+	for (const [k, o] of Object.entries(s.orders ?? {})) if (o.tag === to && o.coin === coin && o.net === net && orderOpen(o, time)) return k;
+	return null;
+}
 const orderOpen = (o: Order, time: number) => time <= o.until + RULES.orderGrace || o.tx !== undefined;
 export const feeOwedOf = (s: State, a: string) => (s.feeOwed && own(s.feeOwed, a) ? s.feeOwed[a] : 0);
 /** take what `seller` owes in fees from `pay` of `asset` they are about to receive; returns how much goes to the owner */
 function collectOwed(s: State, seller: string, asset: string, room: number): () => number {
-	const owed = feeOwedOf(s, seller); if (!owed || room <= 0) return () => 0;
+	const join = joinDueAt(s, seller), owed = feeOwedOf(s, seller) + join; if (!owed || room <= 0) return () => 0; // a shop's $5 counts once its free days are over
 	const cost = usdCost(s, asset, owed); if (cost === null) return () => 0;
 	const take = Math.min(room, cost), cut = usdWorth(s, asset, take) ?? 0;
-	return () => { const left = take >= cost ? 0 : Math.max(0, owed - cut); if (left) s.feeOwed![seller] = left; else delete s.feeOwed![seller]; return take; };
+	return () => {
+		if (join) { delete s.joinDue![seller]; if (emptyOf(s.joinDue!)) delete s.joinDue; }
+		const left = take >= cost ? 0 : Math.max(0, owed - cut); if (left) (s.feeOwed ??= {})[seller] = left; else if (s.feeOwed) delete s.feeOwed[seller]; return take;
+	};
 }
 
 const HANDLERS: Record<string, Handler> = {
+	...Object.fromEntries(Object.entries(BLOB_HANDLERS).map(([k, f]): [string, Handler] => [k, (s, from, d, id, time, ctx) => f(s as unknown as Parameters<typeof f>[0], from, d, id, time, ctx, blobBank(s))])), // files and NFTs (blobs.ts)
+	...Object.fromEntries(Object.entries(EVM_HANDLERS).map(([k, f]): [string, Handler] => [k, (s, from, d, id, time, ctx) => f(s as unknown as Parameters<typeof f>[0], from, d, id, time, ctx, { ...bankOf(s), toFees: (n) => { s.sun!.feePot += n; }, carried: ctx.fee ?? 0, carrier: ctx.payer })])), // Solidity (evmledger.ts)
+	...Object.fromEntries(Object.entries(ZONE_HANDLERS).map(([k, f]): [string, Handler] => [k, (s, from, d, id, time, ctx) => f(s, from, d, id, time, ctx, bankOf(s))])), // layers (zones.ts)
 	...(SUN_HANDLERS as Record<string, Handler>), // lock, lock.ready, renew, ticket.answer (only on a chain with the Sun)
 	/** send any asset to another account */
 	transfer(s, from, d) {
@@ -912,6 +1456,7 @@ const HANDLERS: Record<string, Handler> = {
 		const asset = assetOf(s, d.asset), amount = amountOf(d.amount);
 		if (balanceOf(s, from, asset) < amount) fail('not enough balance');
 		if (asset === NATIVE) return () => { sub(s, from, NATIVE, amount); toTreasury(s, amount); };
+		if (s.assets[asset].nft) fail('burn an NFT with nft.burn: it gives back the DZY in it');
 		if (s.assets[asset].backed) fail('points are cashed in, not burned: points.redeem gives their DZY back');
 		return () => { sub(s, from, asset, amount); s.assets[asset].supply -= amount; };
 	},
@@ -980,7 +1525,7 @@ const HANDLERS: Record<string, Handler> = {
 	},
 	/** the issuer makes `amount` points (to itself, or straight to `to`) by paying their backing in DZY */
 	'points.mint'(s, from, d) {
-		const asset = assetOf(s, d.asset), a = s.assets[asset], b = a.backed ?? fail('these are not points');
+		const asset = assetOf(s, d.asset), a = s.assets[asset], b = a.backed && !a.nft ? a.backed : fail('these are not points');
 		if (a.issuer !== from) fail('only the issuer makes these points');
 		const amount = amountOf(d.amount), to = d.to === undefined ? from : isAddr(d.to) ? d.to : fail('bad receiver');
 		const cost = amount * b.per;
@@ -990,7 +1535,7 @@ const HANDLERS: Record<string, Handler> = {
 	},
 	/** anyone holding points cashes them in: the points are gone, and their backing comes back as DZY */
 	'points.redeem'(s, from, d) {
-		const asset = assetOf(s, d.asset), a = s.assets[asset], b = a.backed ?? fail('these are not points');
+		const asset = assetOf(s, d.asset), a = s.assets[asset], b = a.backed && !a.nft ? a.backed : fail('these are not points');
 		const amount = amountOf(d.amount);
 		if (balanceOf(s, from, asset) < amount) fail('not enough points');
 		const pay = amount * b.per;
@@ -1001,7 +1546,7 @@ const HANDLERS: Record<string, Handler> = {
 	/** a validator's reading of each coin's price (µ$ per whole coin), from its own price sources */
 	'x.price'(s, from, d, _id, time) {
 		if (!exchangeOn(s)) fail('the exchange is not open on this chain');
-		if (!s.validators.includes(from)) fail('only a validator posts prices');
+		if (!mayVouch(s, from)) fail('only a validator posts prices');
 		const p = d.p && typeof d.p === 'object' && !Array.isArray(d.p) ? d.p as Record<string, unknown> : fail('prices are { p: { BTC, ETH, SOL, USDC } } in millionths of a dollar');
 		const out: Record<string, number> = {};
 		for (const [c, v] of Object.entries(p)) {
@@ -1016,35 +1561,115 @@ const HANDLERS: Record<string, Handler> = {
 	    claims only, and may take its coin straight back (it is never stranded). */
 	'x.deposit'(s, from, d, _id, time, ctx) {
 		if (!exchangeOn(s)) fail('the exchange is not open on this chain');
-		if (!s.validators.includes(from)) fail('only a validator confirms a deposit');
+		if (!mayVouch(s, from)) fail('only a validator confirms a deposit');
+		if (d.coin === 'wDZY') return wdzyIn(s, from, d, time); // DZY coming home from Solana
 		const coin = typeof d.coin === 'string' && xLive(s, d.coin) ? d.coin : fail('no such coin on the exchange');
 		const net = typeof d.net === 'string' && xLive(s, coin, d.net) ? d.net : fail(`${coin} is held on ${X_COINS[coin].nets.filter((n) => xLive(s, coin, n)).join(', ')}`);
+		if (s.heart?.proof && net === 'btc') fail('a Bitcoin payment comes with its proof (x.prove): nobody\'s word counts');
 		const amount = amountOf(d.amount), to = isAddr(d.to) ? d.to : fail('bad Dznye address');
 		const tx = typeof d.tx === 'string' && d.tx.length >= 32 && d.tx.length <= 100 && /^[0-9A-Za-z]+$/.test(d.tx) ? d.tx : fail('bad payment id');
 		const seen = `${net}:${tx}`;
 		if (s.xseen && own(s.xseen, seen)) fail('that payment was already counted');
+		if (s.xwaits && own(s.xwaits, seen)) fail('that payment is confirmed, and waits for anyone to object');
 		const key = `${seen}:${coin}:${amount}:${to}`, c = s.xclaims && own(s.xclaims, key) ? s.xclaims[key] : null;
 		if (c?.votes.includes(from)) fail('this validator already confirmed it');
 		const votes = [...(c?.votes ?? []), from], w = powers(s);
 		const said = votes.reduce((n, v) => n + (w[v] ?? 0), 0), all = Object.values(w).reduce((n, v) => n + v, 0);
-		if (said * 3 <= all * 2) return () => { (s.xclaims ??= {})[key] = { at: time, votes }; };
+		if (said * 3 <= all * 2 || !vouched(s, votes)) return () => { (s.xclaims ??= {})[key] = { at: time, votes }; };
+		const pay = { net, coin, amount, to, seen };
+		if (s.heart?.proof) { // a little counts at once each day; the rest waits for anyone to object
+			const price = xPrice(s, coin, time), usd = price === null ? Infinity : N((B(amount) * B(price)) / 10n ** B(X_COINS[coin].decimals));
+			if (usd > instantLeft(s)) return () => { (s.xwaits ??= {})[seen] = { net, coin, amount, to, at: time, until: time + PROOF.wait, votes }; dropClaims(s, seen); };
+			return () => { instantUse(s, usd); depositCounts(s, ctx.height, pay, time, time); };
+		}
+		return () => depositCounts(s, ctx.height, pay, time, time);
+	},
+	/** Any guardian (a key with 1 DZY staked and a day of seconds online) that cannot find a waiting payment on its chain stops
+	    it, for everyone to look again. If it turns out to have been there, the guardian's seconds start again from nothing. */
+	'x.doubt'(s, from, d, _id, time) {
+		for (const k of Object.keys(d)) if (k !== 'id') fail(`"${k}" is not expected here`);
+		const w = s.xwaits && own(s.xwaits, d.id) ? s.xwaits[d.id as string] : fail('no such payment waits');
+		if (!isCandidate(s, from) || ownHours(s, from) < PROOF.guardian) fail('a guardian has 1 DZY staked and has been online for a day');
+		if (w.by !== undefined) fail('it is being looked at again already');
+		if (time > w.until) fail('too late: it may be counted now');
+		return () => { w.by = from; w.until = time + PROOF.hold; };
+	},
+	/** An anchor throws out a waiting payment that was never made (if it was, it may be confirmed again). When a guardian had
+	    objected, every other validator that said it saw it loses its seat for 30 days, all its raffle shards, and a tenth of its
+	    stake: half to that guardian, half to the bonus drawn among the honest. (Not all of it: an honest one can be lied to by
+	    the other chain's servers. What can be proven, signing two blocks, costs everything: evidence.) */
+	'x.drop'(s, from, d, _id, time) {
+		for (const k of Object.keys(d)) if (k !== 'id') fail(`"${k}" is not expected here`);
+		if (!(s.xwaits && own(s.xwaits, d.id))) fail('no such payment waits');
+		if (!vouchers(s).includes(from)) fail('only an original validator throws one out');
+		const w = s.xwaits![d.id as string];
 		return () => {
-			const x = xOf(s), held = `${net}:${coin}`, lim = X_LIMITS[coin], u = s.sun!;
-			const vaultTotal = Object.entries(x.vaults).filter(([k]) => k.endsWith(':' + coin)).reduce((n, [, v]) => n + v, 0);
-			x.vaults[held] = (x.vaults[held] ?? 0) + amount;
-			const price = xPrice(s, coin, time), usd = price === null ? 0n : (B(amount) * B(price)) / 10n ** B(X_COINS[coin].decimals);
-			const parked = !!x.park && own(x.park, to);
-			const capped = !xUnlimited(s, ctx.height), units = parked || price === null || (capped && (amount > lim.deposit || vaultTotal + amount > lim.vault)) || u.salePot <= 0 ? 0 : N(saleUnitsFor(V2, B(u.sold), usd));
-			const given = units > 0 && units <= u.salePot ? units : 0;
-			if (given) { u.salePot -= given; u.sold += given; add(s, to, NATIVE, given); (x.locks ??= {})[`${to}:${coin}`] = (x.locks[`${to}:${coin}`] ?? 0) + amount; } // locked in the buyer's own name
-			else { claimAsset(s, coin).supply += amount; claimAsset(s, coin).minted += amount; add(s, to, 'x' + coin, amount); } // free coin, theirs: to trade or take straight back
-			(s.xseen ??= {})[seen] = { at: time, to, coin, amount, dzy: given };
-			if (s.xclaims) for (const k of Object.keys(s.xclaims)) if (k.startsWith(seen + ':')) delete s.xclaims[k];
+			delete s.xwaits![d.id as string]; if (emptyOf(s.xwaits!)) delete s.xwaits;
+			if (w.by === undefined) return;
+			for (const v of w.votes ?? []) {
+				const st = !s.heart!.anchors.includes(v) && s.stakes && own(s.stakes, v) ? s.stakes[v] : null; if (!st || st.tomb) continue;
+				const cut = mulDiv(st.bond, PROOF.liarBp, 10_000), half = Math.floor(cut / 2);
+				st.bond -= cut; add(s, w.by, NATIVE, half); s.sun!.council.bonus += cut - half;
+				st.jailed = Math.max(st.jailed ?? 0, time + PROOF.liarOut);
+				if (s.nodes && own(s.nodes, v)) s.nodes[v] = { ...s.nodes[v], on: 0 };
+			}
 		};
+	},
+	/** the wait is over: it counts (anyone; the nodes send this by themselves) */
+	'x.count'(s, _from, d, _id, time, ctx) {
+		for (const k of Object.keys(d)) if (k !== 'id') fail(`"${k}" is not expected here`);
+		const seen = s.xwaits && own(s.xwaits, d.id) ? (d.id as string) : fail('no such payment waits'), w = s.xwaits![seen];
+		if (time <= w.until) fail('it still waits for anyone to object');
+		if (w.block && !s.sun!.btc?.recent.some(([n, x]) => n === w.block![0] && x === w.block![1])) return () => { delete s.xwaits![seen]; if (emptyOf(s.xwaits!)) delete s.xwaits; }; // that block is not Bitcoin's any more: it was never paid (if it was, its real block proves it)
+		return () => {
+			delete s.xwaits![seen]; if (emptyOf(s.xwaits!)) delete s.xwaits;
+			if (w.by !== undefined && s.nodes && own(s.nodes, w.by)) s.nodes[w.by] = { ...s.nodes[w.by], on: 0 };
+			depositCounts(s, ctx.height, { net: w.net, coin: w.coin, amount: w.amount, to: w.to, seen }, time, w.at);
+		};
+	},
+	/** A Bitcoin payment into the vault, with its whole proof: the transaction itself, the block header it is in (one the chain
+	    holds, checked work and all: sun.btc), and the path between them. Anyone may hand it in; every node checks all of
+	    it; nobody's word is needed. It pays the vault's address, and says whose it is in an OP_RETURN: "dzy:" + a Dznye address. */
+	'x.prove'(s, _from, d, _id, time, ctx) {
+		for (const k of Object.keys(d)) if (!['tx', 'header', 'height', 'path', 'pos'].includes(k)) fail(`"${k}" is not expected here`);
+		if (!s.heart?.proof || !exchangeOn(s) || !xLive(s, 'BTC', 'btc')) fail('Bitcoin proofs are not open on this chain');
+		const vault = btcAddress(exchangeVaults(s).btc) ?? fail('the chain has no Bitcoin vault yet');
+		const btc = s.sun!.btc ?? fail('the chain holds no Bitcoin headers yet'), h = Number.isSafeInteger(d.height) ? (d.height as number) : fail('height: the Bitcoin block it is in');
+		const hd = checkHeader(d.header, TEST_FLOOR.get(s.chain) ?? BTC_FLOOR) ?? fail('that is not a Bitcoin block header with real proof of work');
+		if (!btc.recent.some(([n, hash]) => n === h && hash === hd.hash)) fail('that block is not one of the Bitcoin blocks the chain holds (about the last two days)');
+		if (btc.height - h + 1 < PROOF.depth) fail(`that block is not under ${PROOF.depth} blocks yet: in about ${(PROOF.depth - (btc.height - h + 1)) * 10} minutes`);
+		const path = Array.isArray(d.path) && d.path.length <= 24 && d.path.every((x) => typeof x === 'string' && /^[0-9a-f]{64}$/.test(x)) ? (d.path as string[]) : fail('path: the way from the payment to its block'), pos = Number.isSafeInteger(d.pos) && (d.pos as number) >= 0 && (d.pos as number) < 2 ** path.length ? (d.pos as number) : fail('pos: its place in the block');
+		const tx = typeof d.tx === 'string' && d.tx.length <= RULES.maxBtcChars ? parseTx(d.tx) : null;
+		if (!tx || tx.baseSize === 64) fail('tx: the payment itself, as Bitcoin has it'); // (a 64-byte "transaction" could be two inner hashes of the tree)
+		if (merkleRootOf(tx!.txid, path, pos) !== hd.merkle) fail('that payment is not in that block');
+		const script = vault!.script.join(), amount = tx!.outputs.filter((o) => o.script.join() === script).reduce((n, o) => n + o.value, 0);
+		if (amount < PROOF.dust) fail('it does not pay the vault');
+		const says = tx!.outputs.map((o) => opReturnData(o.script)).filter((x): x is Uint8Array => !!x).map((x) => String.fromCharCode(...x)).filter((x) => /^dzy:[0-9a-f]{64}$/.test(x));
+		if (says.length !== 1) fail('it must say whose it is, once: "dzy:" and a Dznye address in an OP_RETURN');
+		const seen = 'btc:' + tx!.txid; if (s.xseen && own(s.xseen, seen)) fail('that payment was already counted');
+		if (s.xwaits && own(s.xwaits, seen)) fail('that payment is proven, and waits a little because it is big');
+		// a very big one waits too, and its block must still be Bitcoin's then: worth more than making six false blocks would cost
+		const price = xPrice(s, 'BTC', time), usd = price === null ? Infinity : N((B(amount) * B(price)) / 10n ** B(X_COINS.BTC.decimals));
+		if (usd > PROOF.sure) return () => { (s.xwaits ??= {})[seen] = { net: 'btc', coin: 'BTC', amount, to: says[0].slice(4), at: time, until: time + PROOF.wait, block: [h, hd.hash] }; };
+		return () => depositCounts(s, ctx.height, { net: 'btc', coin: 'BTC', amount, to: says[0].slice(4), seen }, time, time);
 	},
 	/** Take out free coin: give up `amount` of your free coin (claims) and get that coin, paid on `net` to `to`. Free coin
 	    is coin parked on Dznye or bought on the order book: no DZY is owed for it. 0.1% goes to the pot. The payout is
 	    recorded here; the vault pays it on proof of this block. */
+	/** move your own DZY to Solana: the chain holds them, and the Solana vault pays you the same amount of wDZY */
+	'wdzy.out'(s, from, d, id, time, ctx) {
+		for (const k of Object.keys(d)) if (k !== 'amount' && k !== 'to') fail(`"${k}" is not expected here`);
+		if (!wdzyOn(s, ctx.height)) fail('DZY on Solana is not open on this chain');
+		if (!own(exchangeVaults(s), 'sol')) fail('the Solana vault is not listed yet');
+		const amount = amountOf(d.amount), to = xPayTo('sol', d.to), held = s.wdzy?.held ?? 0;
+		if (amount < WDZY.least) fail(`at least ${WDZY.least / DZY} DZY`);
+		const cap = wdzyCap(s.chain); if (held + amount > cap) fail(`at most ${cap / DZY} DZY are on Solana for now: ${(cap - held) / DZY} more can go`);
+		if (balanceOf(s, from, NATIVE) < amount) fail('not enough DZY');
+		return () => {
+			sub(s, from, NATIVE, amount); (s.wdzy ??= { held: 0 }).held += amount;
+			(s.xpays ??= {})['p' + id.slice(0, 16)] = { h: ctx.height, at: time, by: from, coin: 'wDZY', net: 'sol', amount, to, dzy: amount };
+		};
+	},
 	'x.sell'(s, from, d, id, time, ctx) {
 		if (!exchangeOn(s)) fail('the exchange is not open on this chain');
 		const coin = xCoinOf(s, d.coin), net = xNetOf(s, coin, d.net), to = xPayTo(net, d.to), amount = amountOf(d.amount);
@@ -1055,7 +1680,7 @@ const HANDLERS: Record<string, Handler> = {
 		return () => {
 			const x = xOf(s);
 			sub(s, from, 'x' + coin, amount); claimAsset(s, coin).supply -= amount;
-			potAdd(s, coin, keep); x.vaults[held] -= pay;
+			potAdd(s, coin, coinFee(s, coin, keep)); x.vaults[held] -= pay;
 			(s.xpays ??= {})['p' + id.slice(0, 16)] = { h: ctx.height, at: time, by: from, coin, net, amount: pay, to, dzy: 0 };
 		};
 	},
@@ -1066,26 +1691,29 @@ const HANDLERS: Record<string, Handler> = {
 	    0.1% of what is paid goes to the pot; the DZY go back to the sale, never burned. */
 	'x.close'(s, from, d, id, time, ctx) {
 		if (!exchangeOn(s)) fail('the exchange is not open on this chain');
-		const coin = xCoinOf(s, d.coin), lk = `${from}:${coin}`, lock = s.x?.locks && own(s.x.locks, lk) ? s.x.locks[lk] : 0;
+		const coin = xCoinOf(s, d.coin), lk = `${from}:${coin}`, lock = lockAt(s, lk);
 		if (!lock) fail(`you have no ${coin} locked`);
 		const wallet = d.to === 'wallet', net = wallet ? null : xNetOf(s, coin, d.net), to = wallet ? from : xPayTo(net!, d.to);
 		if (d.keep !== undefined && typeof d.keep !== 'boolean') fail('keep: true or false');
 		const price = xPrice(s, coin, time) ?? fail(`no agreed ${coin} price right now: try again later`);
-		const spot = salePrice(V2, B(s.sun!.sold)), one = 10n ** B(X_COINS[coin].decimals);
-		const whole = N((B(lock) * B(price) * B(DZY) + one * spot - 1n) / (one * spot)); // DZY the whole lock costs today, rounded up
+		const cfg = curveOf(s), spot = salePrice(cfg, B(s.sun!.sold)), one = 10n ** B(X_COINS[coin].decimals), sold = B(s.sun!.sold), curve = closeOnCurve(s, ctx.height);
+		// DZY the whole lock costs today, rounded up: the stretch of the sale curve, from here down, that is worth the lock's dollars
+		// (before: all of it at the price at the top, which let a round trip keep DZY for nothing; see closeOnCurve)
+		const whole = curve ? N(saleBackFor(cfg, sold, (B(lock) * B(price) + one - 1n) / one)) : N((B(lock) * B(price) * B(DZY) + one * spot - 1n) / (one * spot));
 		const offered = d.dzy === undefined ? whole : amountOf(d.dzy);
 		const back = Math.min(offered, whole);
 		if (balanceOf(s, from, NATIVE) < back) fail(`you hold less DZY than that (the whole lock costs ${whole / DZY} DZY today)`);
 		if (back > s.sun!.sold) fail('more than the sale has sold');
-		const buys = back === whole ? lock : Math.min(lock, N((B(back) * spot * one) / (B(DZY) * B(price)))); // rounded down
+		const worth = curve ? ((saleCost(cfg, sold - B(back), sold) - 1n) * one) / B(price) : (B(back) * spot * one) / (B(DZY) * B(price)); // rounded down
+		const buys = back === whole ? lock : Math.min(lock, worth > 0n ? N(worth) : 0);
 		const rest = lock - buys, fee = xFee(buys), out = buys - fee, held = net ? `${net}:${coin}` : '';
 		if (out <= 0) fail('too small to pay out');
 		if (net && (s.x?.vaults[held] ?? 0) < out) fail(`the ${net} vault holds less ${coin} than that: choose another network`);
 		return () => {
 			const x = xOf(s);
-			if (d.keep && rest) x.locks![lk] = rest; else { delete x.locks![lk]; potAdd(s, coin, rest); }
+			if (d.keep && rest) locksOfX(s)![lk] = rest; else { delete locksOfX(s)![lk]; potAdd(s, coin, rest); }
 			sub(s, from, NATIVE, back); s.sun!.salePot += back; s.sun!.sold -= back;
-			potAdd(s, coin, fee);
+			potAdd(s, coin, coinFee(s, coin, fee));
 			if (wallet) { claimAsset(s, coin).supply += out; claimAsset(s, coin).minted += out; add(s, from, 'x' + coin, out); }
 			else { x.vaults[held] -= out; (s.xpays ??= {})['p' + id.slice(0, 16)] = { h: ctx.height, at: time, by: from, coin, net: net!, amount: out, to, dzy: back }; }
 		};
@@ -1095,7 +1723,61 @@ const HANDLERS: Record<string, Handler> = {
 	'x.park'(s, from, d) {
 		if (!exchangeOn(s)) fail('the exchange is not open on this chain');
 		if (typeof d.on !== 'boolean') fail('on: true or false');
-		return () => { const x = xOf(s); if (d.on) (x.park ??= {})[from] = 1; else if (x.park) { delete x.park[from]; if (!Object.keys(x.park).length) delete x.park; } };
+		return () => {
+			if (s.heart) { if (d.on) (s.xparks ??= {})[from] = 1; else if (s.xparks) { delete s.xparks[from]; if (emptyOf(s.xparks)) delete s.xparks; } return; }
+			const x = xOf(s); if (d.on) (x.park ??= {})[from] = 1; else if (x.park) { delete x.park[from]; if (!Object.keys(x.park).length) delete x.park; }
+		};
+	},
+	/** Give free coin to the reserve, for nothing back: it backs the unbacked DZY first (the fee account backs early DZY this
+	    way), then lifts the price for everyone. Only from the index's block; it leaves only as DZY sold at the index price. */
+	'reserve.give'(s, from, d, _id, _time, ctx) {
+		if (!s.heart || ctx.height < indexFrom(s.chain)) fail('The reserve takes gifts from block ' + indexFrom(s.chain).toLocaleString('en-US') + '. Try again then.');
+		const coin = xCoinOf(s, d.coin), amount = amountOf(d.amount);
+		if (balanceOf(s, from, 'x' + coin) < amount) fail(`you hold less free ${coin} than that`);
+		return () => {
+			const price = xPrice(s, coin, s.time), n = indexOn(s) ? indexNav(s, s.time) : null;
+			if (n && price) wash(s, n, (B(amount) * B(price)) / 10n ** B(X_COINS[coin].decimals), 10_000n); // the unbacked first
+			sub(s, from, 'x' + coin, amount); s.assets['x' + coin].supply -= amount; potAdd(s, coin, amount);
+		};
+	},
+	/** Validators vote a coin out of the reserve ('out'), count it as nothing ('zero'), or undo either ('back'): for a hack
+	    or a coin shut down. More than two thirds of the say decide. It never sends a coin to anyone. */
+	'reserve.retire'(s, from, d, _id, _time, ctx) {
+		if (!s.heart || ctx.height < indexFrom(s.chain)) fail('Reserve votes open at block ' + indexFrom(s.chain).toLocaleString('en-US') + '.');
+		if (!mayVouch(s, from)) fail('only validators decide which coins the reserve holds');
+		const coin = xCoinOf(s, d.coin), mode = d.mode === 'out' || d.mode === 'zero' || d.mode === 'back' ? d.mode : fail("mode: 'out', 'zero' or 'back'");
+		const key = `${coin}:${mode}`, was = s.x?.rvotes && own(s.x.rvotes, key) ? s.x.rvotes[key] : [];
+		if (was.includes(from)) fail('this validator already voted for that');
+		const votes = [...was, from], w = powers(s);
+		const said = votes.reduce((n, v) => n + (w[v] ?? 0), 0), all = Object.values(w).reduce((n, v) => n + v, 0), passes = said * 3 > all * 2 && vouched(s, votes);
+		return () => {
+			const x = xOf(s);
+			if (!passes) { (x.rvotes ??= {})[key] = votes; return; }
+			if (x.rvotes) { for (const m of ['out', 'zero', 'back']) delete x.rvotes[`${coin}:${m}`]; if (emptyOf(x.rvotes)) delete x.rvotes; }
+			if (mode === 'back') { if (x.retired) { delete x.retired[coin]; if (emptyOf(x.retired)) delete x.retired; } }
+			else (x.retired ??= {})[coin] = mode;
+		};
+	},
+	/** Swap good coin into the reserve for a coin voted out ('out'): worth the same at the agreed prices, plus 0.5% */
+	'reserve.swap'(s, from, d, _id, time) {
+		if (!indexOn(s)) fail('Reserve swaps open once DZY has its reserve price.');
+		const want = xCoinOf(s, d.want);
+		if (retiredOf(s, want) !== 'out') fail(`${want} is not leaving the reserve`);
+		const give = typeof d.give === 'string' && isXClaim(s, d.give) ? d.give.slice(1) : fail('give free coin the reserve takes (xUSDT, xUSDC, …)');
+		if (retiredOf(s, give)) fail(`${give} is leaving the reserve too: give another coin`);
+		const amount = amountOf(d.amount);
+		if (balanceOf(s, from, 'x' + give) < amount) fail(`you hold less free ${give} than that`);
+		const pg = xPrice(s, give, time), pw = xPrice(s, want, time);
+		if (!pg || !pw) fail('no agreed price for both coins right now: try again later');
+		const usd = (B(amount) * B(pg)) / 10n ** B(X_COINS[give].decimals);
+		const pay = N((usd * B(10_000n + RETIRE_BONUS_BP) * 10n ** B(X_COINS[want].decimals)) / (10_000n * B(pw))), pot = s.x?.pot?.[want] ?? 0;
+		if (pay <= 0) fail('too small');
+		if (pay > pot) fail(`the reserve holds ${pot} of ${want}: give less`);
+		if (isAmount(d.min) && pay < Number(d.min)) fail('the price moved: you would get less than your minimum');
+		return () => {
+			sub(s, from, 'x' + give, amount); s.assets['x' + give].supply -= amount; potAdd(s, give, amount);
+			xOf(s).pot![want] -= pay; claimAsset(s, want).supply += pay; claimAsset(s, want).minted += pay; add(s, from, 'x' + want, pay);
+		};
 	},
 	/** Sell DZY to the pot at the floor: the pot's value over the DZY in people's hands, never more. Paid as free coin on
 	    Dznye (take it out with x.sell). The DZY go back to the sale, so the floor never falls from it. */
@@ -1105,13 +1787,20 @@ const HANDLERS: Record<string, Handler> = {
 		if (!potHas) fail(`there is no ${coin} in the pot`);
 		if (balanceOf(s, from, NATIVE) < dzy) fail('you hold less DZY than that');
 		if (dzy > s.sun!.sold) fail('more than the sale has sold');
+		if (indexWaiting(s)) fail('Selling to the reserve opens in a moment. Try again shortly.');
+		if (indexOn(s)) { // the index: the same price as a swap, no daily limit
+			const q = indexSale(s, coin, dzy, time) ?? fail('no agreed price for every coin in the reserve right now: try again later');
+			if (q.pay > potHas) fail(`the reserve holds less ${coin} than that: choose another coin or sell less`);
+			return () => { const n = indexNav(s, time); if (n) wash(s, n, B(q.fee), WASH_BP); sub(s, from, NATIVE, dzy); s.sun!.salePot += dzy; s.sun!.sold -= dzy; xOf(s).pot![coin] -= q.pay; claimAsset(s, coin).supply += q.pay; claimAsset(s, coin).minted += q.pay; add(s, from, 'x' + coin, q.pay); };
+		}
 		const f = xFloor(s, time) ?? fail('no agreed price for every coin in the pot right now: try again later');
 		const price = xPrice(s, coin, time)!, one = 10n ** B(X_COINS[coin].decimals);
-		const pay = N((B(dzy) * f.usd * one) / (f.hands * B(price))); // rounded down: never above the floor
-		if (pay <= 0) fail('too small to pay');
+		const gross = N((B(dzy) * f.usd * one) / (f.hands * B(price))); // rounded down: never above the floor
+		if (gross <= 0) fail('too small to pay');
+		const t = takeBacking(s, coin, potHas, gross), pay = t.pay;
 		if (pay > potHas) fail(`the pot holds less ${coin} than that: choose another coin or sell less`);
 		return () => {
-			sub(s, from, NATIVE, dzy); s.sun!.salePot += dzy; s.sun!.sold -= dzy;
+			t.done(); sub(s, from, NATIVE, dzy); s.sun!.salePot += dzy; s.sun!.sold -= dzy;
 			xOf(s).pot![coin] -= pay; claimAsset(s, coin).supply += pay; claimAsset(s, coin).minted += pay; add(s, from, 'x' + coin, pay);
 		};
 	},
@@ -1125,10 +1814,10 @@ const HANDLERS: Record<string, Handler> = {
 		const max = loanMax(coin, coll, price);
 		if (dusd > max) fail(`that much ${coin} lends at most ${dusdText(max)} DUSD`);
 		const key = 'l' + id.slice(0, 16);
-		if (s.x?.loans && own(s.x.loans, key)) fail('loan already exists');
+		if (loansOfX(s) && own(loansOfX(s)!, key)) fail('loan already exists');
 		return () => {
 			sub(s, from, 'x' + coin, coll);
-			(xOf(s).loans ??= {})[key] = { owner: from, coin, coll, debt: dusd, fee: Math.ceil((dusd * RULES.loanOpenBps) / 10_000), at: time };
+			(s.heart ? (s.xloans ??= {}) : (xOf(s).loans ??= {}))[key] = { owner: from, coin, coll, debt: dusd, fee: Math.ceil((dusd * RULES.loanOpenBps) / 10_000), at: time };
 			const a = dusdAsset(s); a.supply += dusd; a.minted += dusd; add(s, from, 'DUSD', dusd);
 		};
 	},
@@ -1140,7 +1829,7 @@ const HANDLERS: Record<string, Handler> = {
 		const max = loanMax(l.coin, l.coll, price);
 		if (l.debt + dusd > max) fail(`this loan can borrow at most ${dusdText(Math.max(0, max - l.debt))} DUSD more`);
 		return () => {
-			const x = s.x!.loans![id]; x.fee = loanFee(x, time) + Math.ceil((dusd * RULES.loanOpenBps) / 10_000); x.at = time; x.debt += dusd;
+			const x = loansOfX(s)![id]; x.fee = loanFee(x, time) + Math.ceil((dusd * RULES.loanOpenBps) / 10_000); x.at = time; x.debt += dusd;
 			const a = dusdAsset(s); a.supply += dusd; a.minted += dusd; add(s, from, 'DUSD', dusd);
 		};
 	},
@@ -1149,14 +1838,14 @@ const HANDLERS: Record<string, Handler> = {
 		const id = d.id as string, l = loanOf(s, d.id), dusd = amountOf(d.dusd);
 		if (dusd > l.debt) fail(`the loan owes less than that: ${dusdText(l.debt)} DUSD`);
 		if (balanceOf(s, from, 'DUSD') < dusd) fail('you hold less DUSD than that');
-		return () => { const x = s.x!.loans![id]; x.fee = loanFee(x, time); x.at = time; x.debt -= dusd; sub(s, from, 'DUSD', dusd); s.assets.DUSD.supply -= dusd; };
+		return () => { const x = loansOfX(s)![id]; x.fee = loanFee(x, time); x.at = time; x.debt -= dusd; sub(s, from, 'DUSD', dusd); s.assets.DUSD.supply -= dusd; };
 	},
 	/** add free coin to your loan */
 	'loan.add'(s, from, d, _id, time) {
 		const id = d.id as string, l = loanOf(s, d.id), coll = amountOf(d.coll);
 		if (l.owner !== from) fail('not your loan');
 		if (balanceOf(s, from, 'x' + l.coin) < coll) fail(`you hold less free ${l.coin} than that`);
-		return () => { const x = s.x!.loans![id]; x.fee = loanFee(x, time); x.at = time; sub(s, from, 'x' + l.coin, coll); x.coll += coll; };
+		return () => { const x = loansOfX(s)![id]; x.fee = loanFee(x, time); x.at = time; sub(s, from, 'x' + l.coin, coll); x.coll += coll; };
 	},
 	/** take coin out of your loan, keeping it above 150% */
 	'loan.withdraw'(s, from, d, _id, time) {
@@ -1165,7 +1854,7 @@ const HANDLERS: Record<string, Handler> = {
 		if (coll >= l.coll) fail('that is all of its coin: repay it and close it instead');
 		const price = xPrice(s, l.coin, time) ?? fail(`no agreed ${l.coin} price right now: try again later`);
 		if (l.debt > loanMax(l.coin, l.coll - coll, price)) fail('that would leave the loan below 150%');
-		return () => { const x = s.x!.loans![id]; x.fee = loanFee(x, time); x.at = time; x.coll -= coll; add(s, from, 'x' + l.coin, coll); };
+		return () => { const x = loansOfX(s)![id]; x.fee = loanFee(x, time); x.at = time; x.coll -= coll; add(s, from, 'x' + l.coin, coll); };
 	},
 	/** close your loan once it owes no DUSD: its fee is taken from its coin to the pot, and the rest is yours as free coin */
 	'loan.close'(s, from, d, _id, time) {
@@ -1186,7 +1875,7 @@ const HANDLERS: Record<string, Handler> = {
 		const prize = Math.min(l.coll, coinFor(l.coin, (B(l.debt) * B(10_000 + RULES.loanBonusBps)) / 10_000n, price, false));
 		return () => {
 			sub(s, from, 'DUSD', l.debt); s.assets.DUSD.supply -= l.debt;
-			const x = s.x!.loans![id]; x.coll -= prize; x.debt = 0; add(s, from, 'x' + l.coin, prize);
+			const x = loansOfX(s)![id]; x.coll -= prize; x.debt = 0; add(s, from, 'x' + l.coin, prize);
 			loanSettle(s, id, fee, price, l.owner);
 		};
 	},
@@ -1223,14 +1912,14 @@ const HANDLERS: Record<string, Handler> = {
 	    validators with more than two thirds of the say agree. */
 	'market.settle'(s, from, d, _id, time) {
 		const m = marketOf(s, d.id);
-		if (!s.validators.includes(from)) fail('only validators settle a market');
+		if (!mayVouch(s, from)) fail('only validators settle a market');
 		if (m.outcome) fail('this market is already settled');
 		if (time < m.until) fail('this market is still open');
 		const outcome = d.outcome === 'YES' || d.outcome === 'NO' || d.outcome === 'VOID' ? d.outcome : fail('the outcome is YES, NO or VOID');
 		if (Object.values(m.votes ?? {}).some((v) => v.includes(from))) fail('this validator already voted');
 		const votes = [...(m.votes?.[outcome] ?? []), from], w = powers(s);
 		const said = votes.reduce((n, v) => n + (w[v] ?? 0), 0), all = Object.values(w).reduce((n, v) => n + v, 0);
-		return () => { if (said * 3 > all * 2) { m.outcome = outcome; delete m.votes; } else (m.votes ??= {})[outcome] = votes; };
+		return () => { if (said * 3 > all * 2 && vouched(s, votes)) { m.outcome = outcome; delete m.votes; } else (m.votes ??= {})[outcome] = votes; };
 	},
 	/** after it settles: your winning shares pay 1 DZY each (VOID: every share half), less 1% to the Sun and 0.5% to the maker */
 	'market.redeem'(s, from, d) {
@@ -1294,7 +1983,7 @@ const HANDLERS: Record<string, Handler> = {
 			if (pay) add(s, from, NATIVE, pay);
 			if (fee) toTreasury(s, fee);
 			const anyLeft = Object.values(r.bets).some((x) => (settled ? x[settled] > 0 : x.up + x.down > 0));
-			if (!anyLeft) { if (r.left) toTreasury(s, r.left); delete s.rounds![key]; if (!Object.keys(s.rounds!).length) delete s.rounds; } // rounding dust to the Sun
+			if (!anyLeft) { if (r.left) toTreasury(s, r.left); delete s.rounds![key]; if (emptyOf(s.rounds!)) delete s.rounds; } // rounding dust to the Sun
 		};
 	},
 	/** List a vault on a network (validators only; it counts once more than two thirds of the say agree on the same vault).
@@ -1302,7 +1991,7 @@ const HANDLERS: Record<string, Handler> = {
 	    is listed once and cannot be swapped for another. */
 	'x.vault'(s, from, d, _id, time) {
 		if (!exchangeOn(s)) fail('the exchange is not open on this chain');
-		if (!s.validators.includes(from)) fail('only a validator lists a vault');
+		if (!mayVouch(s, from)) fail('only a validator lists a vault');
 		const net = typeof d.net === 'string' && Object.keys(X_COINS).some((c) => xLive(s, c, d.net as string)) ? d.net : fail('no such network on the exchange');
 		const address = typeof d.address === 'string' && (net === 'sol' ? X_ADDRESS.sol : net === 'btc' ? X_ADDRESS.btc : X_ADDRESS.evm).test(d.address) ? d.address : fail(`bad vault address on ${net}`);
 		const block = d.from === undefined ? undefined : Number.isSafeInteger(d.from) && d.from >= 0 ? d.from : fail('bad block');
@@ -1311,7 +2000,7 @@ const HANDLERS: Record<string, Handler> = {
 		if (c?.votes.includes(from)) fail('this validator already agreed');
 		const votes = [...(c?.votes ?? []), from], w = powers(s);
 		const said = votes.reduce((n, v) => n + (w[v] ?? 0), 0), all = Object.values(w).reduce((n, v) => n + v, 0);
-		if (said * 3 <= all * 2) return () => { (s.xclaims ??= {})[key] = { at: time, votes }; };
+		if (said * 3 <= all * 2 || !vouched(s, votes)) return () => { (s.xclaims ??= {})[key] = { at: time, votes }; };
 		return () => { (xOf(s).listed ??= {})[net] = block === undefined ? address : `${address}@${block}`; if (s.xclaims && own(s.xclaims, key)) delete s.xclaims[key]; };
 	},
 	/** a validator records that a vault paid a payout (with the payment's id on that chain), so everyone can see it done */
@@ -1332,7 +2021,7 @@ const HANDLERS: Record<string, Handler> = {
 		const key = 'o' + id.slice(0, 16);
 		if (own(s.offers, key)) fail('offer already exists');
 		if (d.fill !== undefined && typeof d.fill !== 'boolean') fail('fill: true or false');
-		if (!d.fill) return () => { sub(s, from, give.asset, give.amount); s.offers[key] = { maker: from, give, want, ...(until === undefined ? {} : { until }) }; };
+		if (!d.fill) return () => { sub(s, from, give.asset, give.amount); s.offers[key] = { maker: from, give, want, ...(until === undefined ? {} : { until }) }; bookAdd(s, key, time); };
 		// fill: first trade with the offers on the other side that meet this price (each at its maker's own price, which is
 		// as good or better), then leave the rest open at this offer's price
 		const fills: Fill[] = [];
@@ -1348,7 +2037,7 @@ const HANDLERS: Record<string, Handler> = {
 		const restWant = left > 0 && wantLeft > 0 ? N((B(left) * B(want.amount) + B(give.amount) - 1n) / B(give.amount)) : 0;
 		return () => {
 			for (const f of fills) fillOffer(s, f.key, from, f.take, f.pay, height_(s), time);
-			if (left > 0 && restWant > 0) { sub(s, from, give.asset, left); s.offers[key] = { maker: from, give: { asset: give.asset, amount: left }, want: { asset: want.asset, amount: restWant }, ...(until === undefined ? {} : { until }) }; }
+			if (left > 0 && restWant > 0) { sub(s, from, give.asset, left); s.offers[key] = { maker: from, give: { asset: give.asset, amount: left }, want: { asset: want.asset, amount: restWant }, ...(until === undefined ? {} : { until }) }; bookAdd(s, key, time); }
 		};
 	},
 	/** Accept an offer, all of it or part: both sides move in one step, or nothing moves. `amount` (optional) is how much
@@ -1383,7 +2072,7 @@ const HANDLERS: Record<string, Handler> = {
 		const key = own(s.offers, d.id) ? d.id : fail('no such offer');
 		const o = s.offers[key];
 		if (o.maker !== from && !(o.until !== undefined && time > o.until)) fail('only the maker can cancel');
-		return () => { add(s, o.maker, o.give.asset, o.give.amount); delete s.offers[key]; };
+		return () => { add(s, o.maker, o.give.asset, o.give.amount); bookDrop(s, o, key); delete s.offers[key]; };
 	},
 
 	/* ---- offers paid on another chain (see XOffer) ---- */
@@ -1438,7 +2127,7 @@ const HANDLERS: Record<string, Handler> = {
 	/** a validator reports that the payment for a hold is final on the other chain (`tx`: that chain's transaction id).
 	    Once validators with more than two thirds of the say have reported it, the held coins go to the taker. */
 	'xoffer.attest'(s, from, d, _id, time, ctx) {
-		if (!s.validators.includes(from)) fail('only a validator can report a payment');
+		if (!mayVouch(s, from)) fail('only a validator can report a payment');
 		const key = s.xoffers && own(s.xoffers, d.id) ? d.id : fail('no such offer');
 		const o = s.xoffers![key], h = o.hold ?? fail('nobody is paying for this offer');
 		if (d.key !== h.key) fail('that payment is for another hold');
@@ -1448,7 +2137,7 @@ const HANDLERS: Record<string, Handler> = {
 		if (o.want.nft && s.xseen && own(s.xseen, seen)) fail('that delivery was already counted');
 		const votes = [...(h.votes ?? []), from], w = powers(s);
 		const said = votes.reduce((n, v) => n + (w[v] ?? 0), 0), all = Object.values(w).reduce((n, v) => n + v, 0);
-		if (said * 3 <= all * 2) return () => { h.votes = votes; }; // not enough of the say yet
+		if (said * 3 <= all * 2 || !vouched(s, votes)) return () => { h.votes = votes; }; // not enough of the say yet
 		// the network's cut: 0.1% of the DZY, to the Sun, which pays it out to validators and holders by the chain's rules
 		const cut = o.give.asset === NATIVE ? Math.ceil((h.take * RULES.xServiceBps) / 10_000) : 0;
 		return () => {
@@ -1456,7 +2145,7 @@ const HANDLERS: Record<string, Handler> = {
 			if (o.want.nft) (s.xseen ??= {})[seen] = { at: time, to: o.maker, coin: 'NFT', amount: 1, dzy: h.take };
 			const t: Trade = { h: ctx.height, t: time, offer: key, maker: o.maker, taker: h.by, sold: { asset: o.give.asset, amount: h.take }, paid: { asset: xAsset(o.want), amount: h.pay }, via: d.tx as string };
 			s.trades = [...(s.trades ?? []), t].slice(-RULES.maxTrades);
-			if (h.take === o.give.amount) { delete s.xoffers![key]; if (!Object.keys(s.xoffers!).length) delete s.xoffers; }
+			if (h.take === o.give.amount) { delete s.xoffers![key]; if (emptyOf(s.xoffers!)) delete s.xoffers; }
 			else { o.give = { asset: o.give.asset, amount: o.give.amount - h.take }; o.want = { ...o.want, amount: o.want.amount - h.pay }; delete o.hold; }
 		};
 	},
@@ -1466,7 +2155,7 @@ const HANDLERS: Record<string, Handler> = {
 		const o = s.xoffers![key];
 		if (o.maker !== from && !(o.until !== undefined && time > o.until)) fail('only the maker can cancel');
 		if (o.hold && time <= o.hold.until + RULES.xGrace) fail('someone is paying for this offer right now: try again in a few minutes');
-		return () => { add(s, o.maker, o.give.asset, o.give.amount); delete s.xoffers![key]; if (!Object.keys(s.xoffers!).length) delete s.xoffers; };
+		return () => { add(s, o.maker, o.give.asset, o.give.amount); delete s.xoffers![key]; if (emptyOf(s.xoffers!)) delete s.xoffers; };
 	},
 
 	/* ---- liquidity pools: instant swaps of any token against DZY (see LiquidityPool) ---- */
@@ -1474,6 +2163,7 @@ const HANDLERS: Record<string, Handler> = {
 	'pool.open'(s, from, d, _id, time) {
 		const asset = assetOf(s, d.asset);
 		if (asset === NATIVE) fail('a pool pairs a token with DZY: name the token');
+		if (s.assets[asset].nft) fail('NFTs trade by offers (their royalties are paid there), not in pools');
 		if (s.liquidity && own(s.liquidity, asset)) fail('this token already has a pool: add to it');
 		const dzy = amountOf(d.dzy), token = amountOf(d.token);
 		if (dzy < RULES.poolMinDzy) fail(`a pool starts with at least ${RULES.poolMinDzy / DZY} DZY`);
@@ -1689,6 +2379,49 @@ const HANDLERS: Record<string, Handler> = {
 	},
 
 	/* ---- creators: tips with a message, and things for sale (a picture, a video, a song, a file, an edition) ---- */
+	/** open a creator's shop (from the checkout upgrade): free to do; $5 goes on what they owe, taken from their first
+	    sales and tips. Selling needs it; being tipped does not. */
+	'creator.join'(s, from, d, _id, time, ctx) {
+		for (const k of Object.keys(d)) fail(`"${k}" is not expected here`);
+		if (!checkoutV2(s)) fail('shops open with the checkout upgrade');
+		if (s.creators && own(s.creators, from)) fail('your shop is already open');
+		if (joinTrialOn(s, ctx.height)) return () => { (s.creators ??= {})[from] = time; (s.joinDue ??= {})[from] = time + JOIN_TRIAL_MS; }; // 40 free days first
+		return () => { (s.creators ??= {})[from] = time; (s.feeOwed ??= {})[from] = feeOwedOf(s, from) + CREATOR_JOIN_USD; };
+	},
+	/** pay what your shop owes now (its $5, even before the free days end, and any fees on your tab) in any coin the chain
+	    prices, to the network's fee account; `max`: the most you will pay in that coin */
+	'fee.pay'(s, from, d, _id, time, ctx) {
+		for (const k of Object.keys(d)) if (k !== 'asset' && k !== 'max') fail(`"${k}" is not expected here`);
+		if (!joinTrialOn(s, ctx.height)) fail('paying the shop fee opens with the free days');
+		const pending = s.joinDue && own(s.joinDue, from) ? CREATOR_JOIN_USD : 0, usd = feeOwedOf(s, from) + pending;
+		if (!usd) fail('your shop owes nothing');
+		const asset = typeof d.asset === 'string' ? d.asset : fail('name the coin you pay with'), max = Number.isSafeInteger(d.max) && (d.max as number) > 0 ? (d.max as number) : fail('max: the most you will pay');
+		const pay = usdCost(s, asset, usd, time) ?? fail(`the chain has no price for ${asset} right now: pay with DZY, xUSDC or xUSDT`);
+		if (pay > max) fail('the price changed: look again');
+		if (balanceOf(s, from, asset) < pay) fail('not enough balance');
+		return () => { sub(s, from, asset, pay); add(s, RULES.saleFeeTo, asset, pay); if (pending) { delete s.joinDue![from]; if (emptyOf(s.joinDue!)) delete s.joinDue; } if (s.feeOwed) delete s.feeOwed[from]; };
+	},
+	/** the network's fee account sets the creators' fee (from the checkout upgrade): 0 to 20%, in basis points. It counts from
+	    the next sale; nothing already paid changes. */
+	'fee.set'(s, from, d) {
+		for (const k of Object.keys(d)) if (k !== 'bps') fail(`"${k}" is not expected here`);
+		if (!checkoutV2(s)) fail('the fee setting opens with the checkout upgrade');
+		if (from !== RULES.saleFeeTo) fail('only the fee account sets the fee');
+		const bps = Number.isSafeInteger(d.bps) && (d.bps as number) >= 0 && (d.bps as number) <= SALE_FEE_MAX_BPS ? (d.bps as number) : fail(`bps: a whole number from 0 to ${SALE_FEE_MAX_BPS} (20%)`);
+		return () => { s.saleFeeBps = bps; };
+	},
+	/** the network's fee account marks what a creator owes as paid (a fee it collected on another chain, e.g. from the Solana
+	    permission the creator gave): it can only ever lower what they owe */
+	'fee.clear'(s, from, d) {
+		for (const k of Object.keys(d)) if (!['who', 'usd', 'tx'].includes(k)) fail(`"${k}" is not expected here`);
+		if (!checkoutV2(s)) fail('clearing fees opens with the checkout upgrade');
+		if (from !== RULES.saleFeeTo) fail('only the fee account clears fees');
+		const who = isAddr(d.who) ? d.who : fail('who: a Dznye address');
+		const usd = Number.isSafeInteger(d.usd) && (d.usd as number) > 0 ? (d.usd as number) : fail('usd: a whole number of µ$ above zero');
+		if (d.tx !== undefined && !(typeof d.tx === 'string' && /^[0-9A-Za-z]{32,100}$/.test(d.tx))) fail('tx: the payment\'s id');
+		const owed = feeOwedOf(s, who); if (!owed) fail('they owe nothing');
+		return () => { const left = owed - Math.min(owed, usd); if (left) s.feeOwed![who] = left; else delete s.feeOwed![who]; };
+	},
 	/** tip a creator: `amount` of `asset` (DZY by default) with an optional public message; 0.5% to saleFeeTo */
 	tip(s, from, d, _id, time) {
 		for (const k of Object.keys(d)) if (!['to', 'asset', 'amount', 'msg'].includes(k)) fail(`"${k}" is not expected here`);
@@ -1696,7 +2429,7 @@ const HANDLERS: Record<string, Handler> = {
 		const asset = d.asset === undefined ? NATIVE : assetOf(s, d.asset), amount = amountOf(d.amount);
 		if (d.msg !== undefined && (typeof d.msg !== 'string' || d.msg.length > RULES.tipMsgMax)) fail(`a message is at most ${RULES.tipMsgMax} characters`);
 		if (balanceOf(s, from, asset) < amount) fail('not enough balance');
-		const fee = saleFee(amount), usd = usdWorth(s, asset, amount, time), owed = collectOwed(s, to, asset, amount - fee);
+		const fee = saleFee(amount, feeBpsOf(s)), usd = usdWorth(s, asset, amount, time), owed = collectOwed(s, to, asset, amount - fee);
 		return () => {
 			const back = owed(); // fees the creator owes for outside payments, paid from this first
 			sub(s, from, asset, amount); add(s, to, asset, amount - fee - back); if (fee + back) add(s, RULES.saleFeeTo, asset, fee + back);
@@ -1708,13 +2441,15 @@ const HANDLERS: Record<string, Handler> = {
 	},
 	/** buy a seller's item (their record in space "items"): exactly its price, in its asset. The buyer then owns it on
 	    the chain for good (what unlocks its sealed content); an item with `editions` sells that many, no more. */
-	'item.buy'(s, from, d, _id, time) {
-		for (const k of Object.keys(d)) if (!['seller', 'item', 'asset', 'amount', 'max'].includes(k)) fail(`"${k}" is not expected here`);
+	'item.buy'(s, from, d, _id, time, ctx) {
+		const open = bizOn(s, ctx.height);
+		for (const k of Object.keys(d)) if (!['seller', 'item', 'asset', 'amount', 'max', ...(open ? ['at', 'note'] : [])].includes(k)) fail(`"${k}" is not expected here`);
 		const seller = isAddr(d.seller) && d.seller !== from ? d.seller : fail('bad seller (and you cannot buy your own item)');
 		const item = typeof d.item === 'string' && RKEY.test(d.item) ? d.item : fail('bad item');
 		const rec = s.records && own(s.records, `${seller}/items/${item}`) ? s.records[`${seller}/items/${item}`] : null;
 		const v = itemOf(rec?.value) ?? fail('no such item for sale');
 		if (v.off) fail('this item is not for sale right now');
+		if (!creatorJoined(s, seller)) fail('this creator has not opened their shop yet');
 		let asset: string, pay: number;
 		if (v.usd) { // priced in dollars: the buyer picks the coin and names the most they will pay in it
 			asset = typeof d.asset === 'string' ? d.asset : fail('name the coin you pay with');
@@ -1728,27 +2463,95 @@ const HANDLERS: Record<string, Handler> = {
 		}
 		const k = `${from}/${seller}/${item}`, sk = `${seller}/${item}`;
 		const had = s.owned && own(s.owned, k) ? s.owned[k] : null;
-		if (had && !(v.month && had.until !== undefined)) fail('you already own this');
+		// a business offer: bought again and again, maybe with a note, a booking with its slot
+		const rv = rec?.value as Record<string, unknown>, biz = open && typeof rv?.biz === 'string' && BIZ.kinds.includes(rv.biz) ? rv.biz : null, b = biz && rv.book !== undefined ? bookOf(rv.book) : null;
+		if (d.note !== undefined && (!biz || typeof d.note !== 'string' || !d.note.trim() || d.note.length > BIZ.noteMax)) fail(`note: a business offer's note, at most ${BIZ.noteMax} letters`);
+		if (d.at !== undefined && !b) fail('this is not something booked for a time');
+		if (b) { const why = d.at === undefined ? 'at: choose a time' : slotProblem(b, d.at, time); if (why) fail(why); if ((s.slots?.[`${sk}/${d.at}`] ?? 0) >= b.seats) fail('that time is full: choose another'); }
+		if (had && !biz && !(v.month && had.until !== undefined)) fail('you already own this');
 		const sold = s.sales && own(s.sales, sk) ? s.sales[sk] : null;
 		if (v.editions && !had && (sold?.n ?? 0) >= v.editions) fail('sold out');
 		if (balanceOf(s, from, asset) < pay) fail('not enough balance');
-		const fee = saleFee(pay), usd = v.usd || (usdWorth(s, asset, pay, time) ?? 0), owed = collectOwed(s, seller, asset, pay - fee);
+		const card = itemNft(s, rec?.value);
+		if (card && balanceOf(s, seller, card) < 1) fail('sold out: the creator holds no copy any more');
+		const fee = saleFee(pay, feeBpsOf(s)), usd = v.usd || (usdWorth(s, asset, pay, time) ?? 0), owed = collectOwed(s, seller, asset, pay - fee);
 		return () => {
 			const back = owed(); // fees the creator owes for outside payments, paid from this first
+			if (card) { sub(s, seller, card, 1); add(s, from, card, 1); } // the card itself, in the same step
 			sub(s, from, asset, pay); add(s, seller, asset, pay - fee - back); if (fee + back) add(s, RULES.saleFeeTo, asset, fee + back);
 			// a membership runs 30 days from now, or from when the last one ends if it is still running
 			(s.owned ??= {})[k] = { at: time, asset, paid: pay, ...(usd ? { usd } : {}), ...(v.month ? { until: Math.max(time, had?.until ?? 0) + MONTH_MS } : {}), ...(edOn(s) ? (v.editions && !had ? { ed: (sold?.n ?? 0) + 1 } : had?.ed ? { ed: had.ed } : {}) : {}) };
 			const x = ((s.sales ??= {})[sk] ??= { n: 0, total: 0 }); x.n += 1; x.total += pay; if (usd) x.usd = (x.usd ?? 0) + usd;
+			if (biz) { // the business's list of orders and bookings (the newest BIZ.keep), and how full each slot is
+				const at = b ? (d.at as number) : undefined, list = ((s.biz ??= {})[seller] ??= []);
+				list.push({ i: item, by: from, t: time, asset, paid: pay, ...(at !== undefined ? { at } : {}), ...(typeof d.note === 'string' ? { note: d.note.trim() } : {}) });
+				if (list.length > BIZ.keep) list.splice(0, list.length - BIZ.keep);
+				if (at !== undefined) { const sl = (s.slots ??= {}); sl[`${sk}/${at}`] = (sl[`${sk}/${at}`] ?? 0) + 1; for (const q of Object.keys(sl)) if (q.startsWith(sk + '/') && Number(q.slice(sk.length + 1)) < time - 86_400_000) delete sl[q]; }
+			}
+		};
+	},
+
+	/** offer a numbered edition you own for `usd` µ$. `bps` is the fee you saw: if the creator changed it since, refused */
+	'resale.list'(s, from, d, _id, time) {
+		for (const k of Object.keys(d)) if (!['seller', 'item', 'usd', 'bps'].includes(k)) fail(`"${k}" is not expected here`);
+		if (!resaleOn(s)) fail('resale is not open yet');
+		const seller = isAddr(d.seller) ? d.seller : fail('bad creator');
+		const item = typeof d.item === 'string' && RKEY.test(d.item) ? d.item : fail('bad item');
+		const usd = Number.isSafeInteger(d.usd) && (d.usd as number) >= RESALE.minUsd && (d.usd as number) <= RESALE.maxUsd ? (d.usd as number) : fail('the price: $0.10 to $1,000,000');
+		const k = `${from}/${seller}/${item}`, o = s.owned && own(s.owned, k) ? s.owned[k] : fail('you do not own this');
+		if (!o.ed || o.until !== undefined) fail('only numbered editions can be resold');
+		const rec = s.records && own(s.records, `${seller}/items/${item}`) ? s.records[`${seller}/items/${item}`] : null, bps = resaleBps(rec?.value), card = itemNft(s, rec?.value);
+		if (card && balanceOf(s, from, card) < 1) fail('you do not hold the card any more');
+		if (d.bps !== bps) fail('the resale fee changed: look again');
+		return () => { (s.listings ??= {})[k] = { usd, bps, at: time }; };
+	},
+	/** take your offer back */
+	'resale.cancel'(s, from, d) {
+		for (const k of Object.keys(d)) if (!['seller', 'item'].includes(k)) fail(`"${k}" is not expected here`);
+		const k = `${from}/${String(d.seller)}/${String(d.item)}`;
+		if (!(s.listings && own(s.listings, k))) fail('you do not offer this');
+		return () => { delete s.listings![k]; if (emptyOf(s.listings!)) delete s.listings; };
+	},
+	/** buy an edition from its owner, in any coin the chain prices: `usd` is the price you saw, `max` the most you pay */
+	'resale.buy'(s, from, d, _id, time) {
+		for (const k of Object.keys(d)) if (!['owner', 'seller', 'item', 'asset', 'usd', 'max'].includes(k)) fail(`"${k}" is not expected here`);
+		const owner = isAddr(d.owner) && d.owner !== from ? d.owner : fail('bad owner (and you cannot buy your own)');
+		const seller = isAddr(d.seller) ? d.seller : fail('bad creator');
+		const item = typeof d.item === 'string' && RKEY.test(d.item) ? d.item : fail('bad item');
+		const k = `${owner}/${seller}/${item}`, mine = `${from}/${seller}/${item}`, sk = `${seller}/${item}`;
+		const l = s.listings && own(s.listings, k) ? s.listings[k] : fail('that is not for sale any more');
+		const o = s.owned && own(s.owned, k) ? s.owned[k] : fail('that is not for sale any more');
+		if (d.usd !== l.usd) fail('the price changed: look again');
+		if (s.owned && own(s.owned, mine)) fail('you already own one of these');
+		const asset = typeof d.asset === 'string' ? d.asset : fail('name the coin you pay with');
+		const max = Number.isSafeInteger(d.max) && (d.max as number) > 0 ? (d.max as number) : fail('max: the most you will pay, in whole units of that coin');
+		const pay = usdCost(s, asset, l.usd, time) ?? fail(`the chain has no price for ${asset} right now: pay with DZY, xUSDC or xUSDT`);
+		if (pay > max) fail('the price changed: look again');
+		if (balanceOf(s, from, asset) < pay) fail('not enough balance');
+		const rec = s.records && own(s.records, `${seller}/items/${item}`) ? s.records[`${seller}/items/${item}`] : null, card = itemNft(s, rec?.value);
+		if (card && balanceOf(s, owner, card) < 1) fail('that is not for sale any more');
+		const x = resaleSplit(pay, l.bps), owed = collectOwed(s, seller, asset, x.creator);
+		return () => {
+			const back = owed(); // what the creator owes is taken from their share, as from any sale
+			if (card) { sub(s, owner, card, 1); add(s, from, card, 1); } // the card itself, in the same step
+			sub(s, from, asset, pay);
+			add(s, owner, asset, x.owner);
+			if (x.creator - back) add(s, seller, asset, x.creator - back);
+			if (x.founder + back) add(s, RULES.saleFeeTo, asset, x.founder + back);
+			delete s.listings![k]; if (emptyOf(s.listings!)) delete s.listings;
+			delete s.owned![k];
+			s.owned![mine] = { at: time, asset, paid: pay, usd: l.usd, ...(o.ed ? { ed: o.ed } : {}) };
+			const r = ((s.resales ??= {})[sk] ??= { n: 0, usd: 0, last: 0, at: 0 }); r.n += 1; r.usd += l.usd; r.last = l.usd; r.at = time;
 		};
 	},
 
 	/** open a checkout for a dollar-priced item, paid with `coin` on `net` from anywhere */
-	'order.open'(s, from, d, id, time) {
+	'order.open'(s, from, d, id, time, ctx) {
 		for (const k of Object.keys(d)) if (!['seller', 'item', 'net', 'coin'].includes(k)) fail(`"${k}" is not expected here`);
 		const seller = isAddr(d.seller) && d.seller !== from ? d.seller : fail('bad seller (and you cannot buy your own item)');
 		const item = typeof d.item === 'string' && RKEY.test(d.item) ? d.item : fail('bad item');
-		const coin = typeof d.coin === 'string' && own(ORDER_COINS, d.coin) ? d.coin : fail('pay with USDC, USDT, SOL, ETH or BNB');
-		const net = typeof d.net === 'string' && ORDER_COINS[coin].includes(d.net) ? d.net : fail(`${coin} cannot be paid on that network`);
+		const btcOk = orderBtcOn(s, ctx.height), coin = typeof d.coin === 'string' && (own(ORDER_COINS, d.coin) || (btcOk && d.coin === 'BTC')) ? d.coin : fail('pay with USDC, USDT, SOL, ETH or BNB');
+		const net = typeof d.net === 'string' && (coin === 'BTC' ? ['btc'] : ORDER_COINS[coin]).includes(d.net) ? d.net : fail(`${coin} cannot be paid on that network`);
 		const rec = s.records && own(s.records, `${seller}/items/${item}`) ? s.records[`${seller}/items/${item}`] : null;
 		const v = itemOf(rec?.value) ?? fail('no such item for sale');
 		if (v.off) fail('this item is not for sale right now');
@@ -1757,11 +2560,20 @@ const HANDLERS: Record<string, Handler> = {
 		if (had && !(v.month && had.until !== undefined)) fail('you already own this');
 		const sold = s.sales && own(s.sales, `${seller}/${item}`) ? s.sales[`${seller}/${item}`].n : 0;
 		if (v.editions && !had && sold >= v.editions) fail('sold out');
-		if (feeOwedOf(s, seller) > RULES.feeOwedMax) fail('this creator cannot take outside payments right now: pay with a coin on Dznye');
-		const payTo = payToOf(s, seller, net) ?? fail('the creator has no address on that network yet: pick another');
+		const v2 = checkoutV2(s, ctx.height);
+		if (!v2 && (coin === 'POL' || coin === 'AVAX')) fail('pay with USDC, USDT, SOL, ETH or BNB');
+		if (v2 && !creatorJoined(s, seller, ctx.height)) fail('this creator has not opened their shop yet');
+		// Solana has no vault yet: it keeps paying the creator directly, the fee on their tab, until it does
+		const vault = v2 && net !== 'sol' && net !== 'btc' ? checkoutVault(s, coin, net) ?? fail('pay with USDC or USDT on a network Dznye has a vault on, or with a coin on Dznye') : null;
+		const card = itemNft(s, rec?.value, ctx.height);
+		if (card && !vault) fail('a card is paid into a vault (USDC or USDT on a network Dznye has a vault on), or with a coin on Dznye');
+		if (bizOn(s, ctx.height) && (rec?.value as Record<string, unknown> | undefined)?.book !== undefined) fail('a time is booked with a coin in your Dznye wallet, so the time goes with it');
+		if (card && balanceOf(s, seller, card) < 1) fail('sold out: the creator holds no copy any more');
+		if (!vault && feeOwedOf(s, seller) > RULES.feeOwedMax) fail('this creator cannot take outside payments right now: pay with a coin on Dznye');
+		const payTo = vault ?? payToOf(s, seller, net) ?? fail('the creator has no address on that network yet: pick another');
 		const base = orderBase(s, coin, v.usd, time) ?? fail(`the chain has no price for ${coin} right now: pick another coin`);
-		const open = Object.values(s.orders ?? {}).filter((o) => orderOpen(o, time));
-		if (open.filter((o) => o.buyer === from).length >= RULES.maxOpenOrders) fail(`at most ${RULES.maxOpenOrders} open checkouts at once: finish or wait for one`);
+		const open = (s.heart ? ordersOf(s, 's' + seller).map((k) => s.orders![k]) : Object.values(s.orders ?? {})).filter((o) => orderOpen(o, time));
+		if ((s.heart ? ordersOf(s, 'b' + from).map((k) => s.orders![k]).filter((o) => orderOpen(o, time)) : open.filter((o) => o.buyer === from)).length >= RULES.maxOpenOrders) fail(`at most ${RULES.maxOpenOrders} open checkouts at once: finish or wait for one`);
 		const used = new Set(open.filter((o) => o.seller === seller && o.net === net && o.coin === coin).map((o) => o.due - o.base));
 		const step = coin === 'USDC' || coin === 'USDT' ? 100 : 100; // 0.0001 of a dollar coin, 0.0000001 of SOL/ETH/BNB
 		let tag = 0; for (let n = 1; n <= RULES.orderTags; n++) if (!used.has(n * step)) { tag = n * step; break; }
@@ -1769,8 +2581,10 @@ const HANDLERS: Record<string, Handler> = {
 		const key = 'o' + id.slice(0, 16);
 		return () => {
 			// clear away this buyer's and this creator's ended orders, so the list never grows
-			for (const [k, o] of Object.entries(s.orders ?? {})) if (!orderOpen(o, time) && (o.buyer === from || o.seller === seller)) delete s.orders![k];
-			(s.orders ??= {})[key] = { buyer: from, seller, item, net, coin, payTo, base, due: base + tag, usd: v.usd, memo: 'dzy:' + key, at: time, until: time + RULES.orderLife };
+			if (s.heart) { for (const k of new Set([...ordersOf(s, 'b' + from), ...ordersOf(s, 's' + seller)])) if (!orderOpen(s.orders![k], time)) orderDrop(s, k); }
+			else for (const [k, o] of Object.entries(s.orders ?? {})) if (!orderOpen(o, time) && (o.buyer === from || o.seller === seller)) delete s.orders![k];
+			(s.orders ??= {})[key] = { buyer: from, seller, item, net, coin, payTo, base, due: base + tag, usd: v.usd, memo: 'dzy:' + key, at: time, until: time + RULES.orderLife, ...(vault ? { vault: true as const } : {}), ...(vault && NATIVE_PAY.has(coin) ? { tag: id } : {}) };
+			orderAdd(s, key);
 		};
 	},
 	/** the buyer names the payment (that chain's transaction id); naming another one replaces it until it is counted */
@@ -1778,6 +2592,7 @@ const HANDLERS: Record<string, Handler> = {
 		const key = s.orders && own(s.orders, d.id) ? d.id : fail('no such checkout');
 		const o = s.orders![key];
 		if (o.buyer !== from) fail('this checkout is someone else\'s');
+		if (o.tag) fail('this checkout is paid by the vault deposit with its tag: nothing to name');
 		if (o.tx === undefined && time > o.until + RULES.orderGrace) fail('this checkout has ended: start a new one');
 		if (!isXTx(o.net, d.tx)) fail('that is not a transaction id on this network');
 		if (s.xseen && own(s.xseen, `${o.net}:${d.tx}`)) fail('that payment was already counted');
@@ -1785,7 +2600,7 @@ const HANDLERS: Record<string, Handler> = {
 	},
 	/** a validator reports what that payment brought the creator (`amount`, in the coin's Dznye units), read on its chain */
 	'order.attest'(s, from, d, _id, time) {
-		if (!s.validators.includes(from)) fail('only a validator can report a payment');
+		if (!mayVouch(s, from)) fail('only a validator can report a payment');
 		const key = s.orders && own(s.orders, d.id) ? d.id : fail('no such checkout');
 		const o = s.orders![key];
 		if (!o.tx || d.tx !== o.tx) fail('that is not the payment this checkout named');
@@ -1796,34 +2611,27 @@ const HANDLERS: Record<string, Handler> = {
 		// enough: the exact amount, or more; or (an exchange that took its fee from it) at least 99% of the price itself
 		if (amount < o.due && amount < Math.floor((o.base * 99) / 100)) fail('that payment is less than the price');
 		// a payment of exactly another open checkout's amount belongs to that one
-		if (amount !== o.due && Object.entries(s.orders!).some(([k, x]) => k !== key && x.seller === o.seller && x.net === o.net && x.coin === o.coin && x.due === amount && orderOpen(x, time))) fail('that payment belongs to another checkout');
+		if (amount !== o.due && (s.heart ? ordersOf(s, 's' + o.seller).map((k): [string, typeof o] => [k, s.orders![k]]) : Object.entries(s.orders!)).some(([k, x]) => k !== key && x.seller === o.seller && x.net === o.net && x.coin === o.coin && x.due === amount && orderOpen(x, time))) fail('that payment belongs to another checkout');
 		const votes = [...(o.votes ?? []), from], w = powers(s);
 		const said = votes.reduce((n, v) => n + (w[v] ?? 0), 0), all = Object.values(w).reduce((n, v) => n + v, 0);
-		if (said * 3 <= all * 2) return () => { o.votes = votes; };
-		const rec = s.records && own(s.records, `${o.seller}/items/${o.item}`) ? s.records[`${o.seller}/items/${o.item}`] : null, v = itemOf(rec?.value);
-		const k = `${o.buyer}/${o.seller}/${o.item}`, had = s.owned && own(s.owned, k) ? s.owned[k] : null;
-		return () => {
-			(s.xseen ??= {})[seen] = { at: time, to: o.seller, coin: o.coin, amount, dzy: 0 };
-			const sold = s.sales && own(s.sales, `${o.seller}/${o.item}`) ? s.sales[`${o.seller}/${o.item}`].n : 0;
-			(s.owned ??= {})[k] = { at: time, asset: `${o.coin}@${o.net}`, paid: amount, usd: o.usd, ...(v?.month ? { until: Math.max(time, had?.until ?? 0) + MONTH_MS } : {}), ...(edOn(s) ? (v?.editions && !had ? { ed: sold + 1 } : had?.ed ? { ed: had.ed } : {}) : {}) };
-			const x = ((s.sales ??= {})[`${o.seller}/${o.item}`] ??= { n: 0, total: 0 }); x.n += 1; x.usd = (x.usd ?? 0) + o.usd;
-			(s.feeOwed ??= {})[o.seller] = feeOwedOf(s, o.seller) + saleFee(o.usd);
-			delete s.orders![key]; if (!Object.keys(s.orders!).length) delete s.orders;
-		};
+		if (said * 3 <= all * 2 || !vouched(s, votes)) return () => { o.votes = votes; };
+		return () => completeOrder(s, key, amount, time, seen);
 	},
 	/** drop a checkout: its buyer, any time before a payment is named; anyone, once it has ended */
 	'order.cancel'(s, from, d, _id, time) {
 		const key = s.orders && own(s.orders, d.id) ? d.id : fail('no such checkout');
 		const o = s.orders![key];
 		if (!(o.buyer === from && o.tx === undefined) && orderOpen(o, time) && time <= o.until) fail('this checkout is still open');
-		return () => { delete s.orders![key]; if (!Object.keys(s.orders!).length) delete s.orders; };
+		return () => { orderDrop(s, key); };
 	},
 	/** move everything this key owns (things bought, memberships) to another account: a buyer who paid without a wallet
 	    keeps their purchases in their new wallet. Only the key holding them can move them; open checkouts stay. */
 	'owned.move'(s, from, d, _id, time) {
-		for (const k of Object.keys(d)) if (k !== 'to') fail(`"${k}" is not expected here`);
+		for (const k of Object.keys(d)) if (k !== 'to' && !(k === 'items' && s.heart)) fail(`"${k}" is not expected here`);
 		const to = isAddr(d.to) && d.to !== from ? d.to : fail('bad account to move them to');
-		const mine = Object.keys(s.owned ?? {}).filter((k) => k.startsWith(from + '/'));
+		// (the Heart upgrade: it says which, 20 at once: not looked for in everyone's)
+		if (s.heart && !(Array.isArray(d.items) && d.items.length >= 1 && d.items.length <= 20 && new Set(d.items).size === d.items.length && d.items.every((x) => typeof x === 'string' && x.length <= 140))) fail('items: which of them, "creator/item", at most 20 at once');
+		const mine = s.heart ? (d.items as string[]).map((x) => `${from}/${x}`).filter((k) => !!s.owned && own(s.owned, k)) : Object.keys(s.owned ?? {}).filter((k) => k.startsWith(from + '/'));
 		if (!mine.length) fail('this key owns nothing to move');
 		return () => {
 			for (const k of mine) {
@@ -1832,6 +2640,7 @@ const HANDLERS: Record<string, Handler> = {
 				s.owned![dst] = b ? { ...a, ...b, until: a.until !== undefined || b.until !== undefined ? Math.max(a.until ?? 0, b.until ?? 0) : undefined } : a;
 				if (s.owned![dst].until === undefined) delete s.owned![dst].until;
 				delete s.owned![k];
+				if (s.listings && own(s.listings, k)) { delete s.listings[k]; if (emptyOf(s.listings)) delete s.listings; } // moved: no longer offered
 			}
 			void time;
 		};
@@ -1870,14 +2679,14 @@ const HANDLERS: Record<string, Handler> = {
 		if (!ctx.taskOk) fail('the claim must be signed by the task\'s checker');
 		return () => {
 			add(s, to, task.asset, task.reward); task.done[to] = 1; task.left -= 1;
-			if (!task.left) { delete s.tasks![key]; if (!Object.keys(s.tasks!).length) delete s.tasks; }
+			if (!task.left) { delete s.tasks![key]; if (emptyOf(s.tasks!)) delete s.tasks; }
 		};
 	},
 	/** the site closes its task and takes back the rewards nobody has claimed */
 	'task.close'(s, from, d) {
 		const key = s.tasks && own(s.tasks, d.id) ? d.id : fail('no such task'), task = s.tasks![key];
 		if (task.by !== from) fail('only the site that posted a task can close it');
-		return () => { add(s, from, task.asset, task.reward * task.left); delete s.tasks![key]; if (!Object.keys(s.tasks!).length) delete s.tasks; };
+		return () => { add(s, from, task.asset, task.reward * task.left); delete s.tasks![key]; if (emptyOf(s.tasks!)) delete s.tasks; };
 	},
 
 	/* ---- gifts: send to anyone by link (email, chat, a QR code), even before they have an account ---- */
@@ -1898,14 +2707,14 @@ const HANDLERS: Record<string, Handler> = {
 		const to = isAddr(d.to) ? d.to : fail('bad receiver');
 		if (time > g.until) fail('this gift has ended: its sender can take it back');
 		if (!ctx.giftOk) fail('the claim must be signed with the gift\'s key (from its link)');
-		return () => { add(s, to, g.asset, g.amount); delete s.gifts![gid]; if (!Object.keys(s.gifts!).length) delete s.gifts; };
+		return () => { add(s, to, g.asset, g.amount); delete s.gifts![gid]; if (emptyOf(s.gifts!)) delete s.gifts; };
 	},
 	/** the sender takes back a gift nobody claimed in time */
 	'gift.refund'(s, from, d, _id, time) {
 		const gid = s.gifts && own(s.gifts, d.id) ? d.id : fail('no such gift'), g = s.gifts![gid];
 		if (g.from !== from) fail('only its sender can take a gift back');
 		if (time <= g.until) fail('this gift can still be claimed: wait for its end');
-		return () => { add(s, from, g.asset, g.amount); delete s.gifts![gid]; if (!Object.keys(s.gifts!).length) delete s.gifts; };
+		return () => { add(s, from, g.asset, g.amount); delete s.gifts![gid]; if (emptyOf(s.gifts!)) delete s.gifts; };
 	},
 
 	/* ---- records: an app's data on the chain (sign-ups, profiles, orders, entries, documents) ---- */
@@ -1919,11 +2728,16 @@ const HANDLERS: Record<string, Handler> = {
 		if (d.hash !== undefined && !(typeof d.hash === 'string' && /^[0-9a-f]{64}$/.test(d.hash))) fail('hash: the SHA-256 of the file, 64 hex digits');
 		if (d.link !== undefined && (d.hash === undefined || typeof d.link !== 'string' || d.link.length > 200 || !/^(https|ipfs|ar):\/\/[\x21-\x7e]+$/.test(d.link))) fail('link: https://, ipfs:// or ar://, at most 200 characters, with a hash');
 		const k = `${from}/${space}/${key}`, isNew = !(s.records && own(s.records, k));
-		if (isNew && Object.keys(s.records ?? {}).filter((x) => x.startsWith(from + '/')).length >= RULES.maxRecords) fail(`at most ${RULES.maxRecords} records for one account`);
-		const fee = recordFee(space, key, d as { value?: unknown; hash?: string; link?: string });
+		if (space === 'capture' && resaleOn(s, ctx.height) && soldCount(s, from, key)) fail('someone owns this: its capture cannot change any more');
+		if (space === 'items' && nftItemsOn(s, ctx.height)) { const why = nftItemProblem(s, from, d.value); if (why) fail(why); }
+		if (space === 'items' && bizOn(s, ctx.height)) { const why = bizProblem(d.value); if (why) fail(why); }
+		if (space === 'items' && resaleOn(s, ctx.height)) { const why = soldLock(s, from, key, d.value ?? null); if (why) fail(why); }
+		// (the Heart upgrade: no count of everyone's records for each new one; the day's price keeps them in bounds)
+		if (!s.heart && isNew && keysOf(s.records ?? {}).filter((x) => x.startsWith(from + '/')).length >= RULES.maxRecords) fail(`at most ${RULES.maxRecords} records for one account`);
+		const fee = recordFee(space, key, d as { value?: unknown; hash?: string; link?: string }) * keptTimes(s) + (space === 'items' && resaleOn(s, ctx.height) ? itemFileFee(s, from, key, d.value) : 0);
 		if (balanceOf(s, ctx.payer, NATIVE) < fee) fail(`keeping this record costs ${fee / DZY} DZY, and the payer does not hold it`);
 		return () => {
-			sub(s, ctx.payer, NATIVE, fee); toTreasury(s, fee);
+			sub(s, ctx.payer, NATIVE, fee); toTreasury(s, fee); keptAdd(s, space.length + key.length + (d.value !== undefined ? canon(d.value).length : 64 + ((d.link as string | undefined)?.length ?? 0)));
 			(s.records ??= {})[k] = { ...(d.value !== undefined ? { value: d.value } : { hash: d.hash as string, ...(d.link ? { link: d.link as string } : {}) }), at: time };
 		};
 	},
@@ -1931,7 +2745,9 @@ const HANDLERS: Record<string, Handler> = {
 	'record.delete'(s, from, d) {
 		const k = typeof d.space === 'string' && typeof d.key === 'string' ? `${from}/${d.space}/${d.key}` : fail('space and key');
 		if (!(s.records && own(s.records, k))) fail('no such record');
-		return () => { delete s.records![k]; if (!Object.keys(s.records!).length) delete s.records; };
+		if (d.space === 'capture' && resaleOn(s) && soldCount(s, from, d.key as string)) fail('someone owns this: its capture cannot change any more');
+		if (d.space === 'items' && resaleOn(s)) { const why = soldLock(s, from, d.key as string, null); if (why) fail(why); }
+		return () => { delete s.records![k]; if (emptyOf(s.records!)) delete s.records; };
 	},
 
 	/* ---- streams: pay by the minute (subscriptions, salaries, rent, AI compute); nothing is sent while one runs ---- */
@@ -1942,7 +2758,7 @@ const HANDLERS: Record<string, Handler> = {
 		const asset = d.asset === undefined ? NATIVE : assetOf(s, d.asset), perMinute = amountOf(d.perMinute), deposit = amountOf(d.deposit);
 		if (deposit < perMinute) fail('the deposit must cover at least one minute');
 		if (d.note !== undefined && (typeof d.note !== 'string' || d.note.length > RULES.memoMax)) fail('bad note');
-		if (Object.values(s.streams ?? {}).filter((x) => x.from === from).length >= RULES.maxStreams) fail(`at most ${RULES.maxStreams} open streams for one payer`);
+		if (!s.heart && keysOf(s.streams ?? {}).filter((k) => (peek(s.streams!, k) as { from: string }).from === from).length >= RULES.maxStreams) fail(`at most ${RULES.maxStreams} open streams for one payer`);
 		if (balanceOf(s, from, asset) < deposit) fail('not enough balance');
 		const sid = 's' + id.slice(0, 16);
 		if (s.streams && own(s.streams, sid)) fail('stream already exists');
@@ -1953,7 +2769,7 @@ const HANDLERS: Record<string, Handler> = {
 		const sid = s.streams && own(s.streams, d.id) ? d.id : fail('no such stream'), st = s.streams![sid];
 		if (from !== st.to) fail('only its receiver can withdraw');
 		if (st.owed + streamFlow(st, time).flowed === 0) fail('nothing has flowed yet');
-		return () => { streamRebase(st, time); add(s, st.to, st.asset, st.owed); st.owed = 0; if (!st.held) { delete s.streams![sid]; if (!Object.keys(s.streams!).length) delete s.streams; } };
+		return () => { streamRebase(st, time); add(s, st.to, st.asset, st.owed); st.owed = 0; if (!st.held) { delete s.streams![sid]; if (emptyOf(s.streams!)) delete s.streams; } };
 	},
 	/** the payer adds to it (a stream that ran dry starts again from now: nothing is owed for the dry time) */
 	'stream.topup'(s, from, d, _id, time) {
@@ -1971,7 +2787,7 @@ const HANDLERS: Record<string, Handler> = {
 			streamRebase(st, time);
 			if (st.owed) add(s, st.to, st.asset, st.owed);
 			if (st.held) add(s, st.from, st.asset, st.held);
-			delete s.streams![sid]; if (!Object.keys(s.streams!).length) delete s.streams;
+			delete s.streams![sid]; if (emptyOf(s.streams!)) delete s.streams;
 		};
 	},
 
@@ -2067,6 +2883,43 @@ const HANDLERS: Record<string, Handler> = {
 		return () => { delete a.recover; };
 	},
 	/** after the delay, anyone with an account may complete it: the new key joins, nothing else changes */
+	/** Set this account's hash key: one no quantum computer breaks (wots.ts). Its root goes on the chain; its 32 secret bytes stay with
+	    the owner. Once set, only the hash key itself changes it: a thief with the ordinary key cannot. */
+	'q.set'(s, from, d) {
+		if (!s.heart?.fut) fail('hash keys are not open on this chain yet');
+		for (const k of Object.keys(d)) if (k !== 'root') fail(`"${k}" is not expected here`);
+		existing(s, from); if (s.accounts[from].q) fail('it has one already: only that key changes it');
+		const root = typeof d.root === 'string' && /^[0-9a-f]{64}$/.test(d.root) ? d.root : fail('root: the hash key\'s root');
+		return () => { s.accounts[from].q = { root, n: 0 }; };
+	},
+	/** Signed by an account's hash key, handed in by anyone (who pays the fee). It names the next hash key (each signs once), and may:
+	    put a new ordinary key in charge, every other way in gone (`key`); say that from now on nothing but the hash key moves the
+	    account (`only`: true, or false to end that); and do one thing as the account (`act`). */
+	'q.run'(s, _from, d, id, time, ctx) {
+		if (!s.heart?.fut) fail('hash keys are not open on this chain yet');
+		for (const k of Object.keys(d)) if (!['account', 'root', 'key', 'only', 'act', 'seed', 'sig'].includes(k)) fail(`"${k}" is not expected here`);
+		const who = typeof d.account === 'string' && own(s.accounts, d.account) ? d.account : fail('no such account'), a = s.accounts[who], q = a.q ?? fail('that account has no hash key');
+		const root = typeof d.root === 'string' && /^[0-9a-f]{64}$/.test(d.root) && d.root !== q.root ? d.root : fail('root: the next hash key, a new one');
+		const key = d.key === undefined ? undefined : isAddr(d.key) && d.key !== who ? d.key : fail('key: the new ordinary key'), only = d.only === undefined || typeof d.only === 'boolean' ? d.only : fail('only: true or false');
+		const act = d.act === undefined ? undefined : d.act && typeof d.act === 'object' && !Array.isArray(d.act) && Object.keys(d.act).sort().join() === 'data,type' ? (d.act as { type: string; data: Record<string, unknown> }) : fail('act: { type, data }');
+		if (act && (!Q_ACTS.has(act.type) || !act.data || typeof act.data !== 'object' || Array.isArray(act.data))) fail('a hash key does not do that: it sends, takes back stakes and offers, changes coins and keys');
+		if (typeof d.seed !== 'string' || typeof d.sig !== 'string' || wotsRoot(d.seed, d.sig, qMessage(s.chain, who, q.n, { root, key, only, act })) !== q.root) fail('that is not signed by the account\'s hash key');
+		const run = act ? HANDLERS[act.type](s, who, act.data, id, time, ctx) : null;
+		return () => {
+			run?.(); const x = account(s, who), on = only === undefined ? x.q?.only : only || undefined;
+			x.q = { root, n: q.n + 1, ...(on ? { only: true as const } : {}) };
+			if (key) { x.keys = [key]; x.off = true; delete x.agents; delete x.guardian; delete x.recover; delete x.multi; }
+		};
+	},
+	/** Make a lock validator stake (the last rules). It leaves the lockers' share and joins the account's stake, where it counts in the
+	    raffle for blocks (from now: its seconds start again) and pays for cheating. It stays held until the minute the lock would have
+	    ended: a lock is a promise, and moving it never shortens it. */
+	'lock.stake'(s, from, d) {
+		if (!s.heart?.fut || !s.sun) fail('locks become stake from the last rules on');
+		for (const k of Object.keys(d)) if (k !== 'id') fail(`"${k}" is not expected here`);
+		const l = lockOf(s, from, d.id) ?? fail('no such lock of yours'); if (s.stakes?.[from]?.tomb) fail('this key was caught signing two different votes and can never stake again');
+		return () => { const clock = bondAdded(s, from, l.amt), { amt, end } = lockOut(s, from, l.id), st = stakeOf(s, from); st.bond += amt; (st.kept ??= []).push({ n: amt, m: end }); clock?.(st); };
+	},
 	'recover.finish'(s, from, d, _id, time) {
 		existing(s, from);
 		const t = own(s.accounts, d.account) ? s.accounts[d.account] : fail('no such account');
@@ -2082,11 +2935,12 @@ const HANDLERS: Record<string, Handler> = {
 		const amount = amountOf(d.amount);
 		if (s.stakes?.[from]?.tomb) fail('this key was caught signing two different votes and can never stake again; use a new key');
 		if (balanceOf(s, from, NATIVE) < amount) fail('not enough DZY');
-		return () => { sub(s, from, NATIVE, amount); stakeOf(s, from).bond += amount; };
+		return () => { const clock = bondAdded(s, from, amount); sub(s, from, NATIVE, amount); const st = stakeOf(s, from); st.bond += amount; clock?.(st); };
 	},
 	'stake.unbond'(s, from, d, _id, time) {
 		const amount = amountOf(d.amount), st = s.stakes && own(s.stakes, from) ? s.stakes[from] : fail('this account has nothing staked');
 		if (st.bond < amount) fail('that is more than is staked');
+		const held = keptNow(s, st); if (st.bond - amount < held) fail(`${(held / DZY).toLocaleString('en-US')} DZY of this stake came from a lock, and stays until that lock would have ended: at most ${((st.bond - held) / DZY).toLocaleString('en-US')} DZY can be taken back now`);
 		if ((st.unbonding?.length ?? 0) >= RULES.maxUnbonding) fail(`at most ${RULES.maxUnbonding} unlocks can wait at once; withdraw first`);
 		return () => { st.bond -= amount; (st.unbonding ??= []).push({ amount, at: time + RULES.unbondDelay }); };
 	},
@@ -2110,19 +2964,22 @@ const HANDLERS: Record<string, Handler> = {
 		if (s.sun ? !isCandidate(s, v) : !isStaker(s, v)) fail(s.sun ? 'that key has not staked the 1% of a seat that makes it a candidate' : 'that key is not a staked validator right now');
 		const amount = amountOf(d.amount);
 		if (balanceOf(s, from, NATIVE) < amount) fail('not enough DZY');
+		// (the Heart upgrade: at least 1 DZY behind each, so a validator's pay is never shared among thousands of grains)
+		if (s.heart && amount + (s.delegations && own(s.delegations, v) && own(s.delegations[v], from) ? s.delegations[v][from] : 0) < DZY) fail('back a validator with at least 1 DZY');
 		const mine = Object.values(s.delegations ?? {}).filter((m) => own(m, from)).length;
 		if (!(s.delegations && own(s.delegations, v) && own(s.delegations[v], from)) && mine >= RULES.maxDelegations) fail(`you can back at most ${RULES.maxDelegations} validators at once`);
-		return () => { sub(s, from, NATIVE, amount); const m = ((s.delegations ??= {})[v] ??= {}); m[from] = (own(m, from) ? m[from] : 0) + amount; };
+		return () => { backAdded(s, v, from, amount); sub(s, from, NATIVE, amount); const m = ((s.delegations ??= {})[v] ??= {}); m[from] = (own(m, from) ? m[from] : 0) + amount; };
 	},
 	/** stop backing a validator with some DZY: it comes back after the same wait as a validator's own stake */
 	'stake.undelegate'(s, from, d, _id, time) {
 		const v = typeof d.validator === 'string' && s.delegations && own(s.delegations, d.validator) && own(s.delegations[d.validator], from) ? d.validator : fail('you are not backing that validator');
 		const amount = amountOf(d.amount), m = s.delegations![v];
 		if (m[from] < amount) fail('that is more than you back it with');
+		if (s.heart && m[from] - amount > 0 && m[from] - amount < DZY) fail('leave at least 1 DZY behind it, or take all of it back');
 		if ((s.undelegating?.[from]?.length ?? 0) >= RULES.maxUnbonding) fail(`at most ${RULES.maxUnbonding} unlocks can wait at once; claim first`);
 		return () => {
-			m[from] -= amount; if (!m[from]) delete m[from];
-			if (!Object.keys(m).length) { delete s.delegations![v]; if (!Object.keys(s.delegations!).length) delete s.delegations; }
+			m[from] -= amount; if (!m[from]) { delete m[from]; backGone(s, v, from); }
+			if (!Object.keys(m).length) { delete s.delegations![v]; if (emptyOf(s.delegations!)) delete s.delegations; }
 			((s.undelegating ??= {})[from] ??= []).push({ v, amount, at: time + RULES.unbondDelay });
 		};
 	},
@@ -2134,7 +2991,7 @@ const HANDLERS: Record<string, Handler> = {
 		const total = ready.reduce((n, u) => n + u.amount, 0);
 		return () => {
 			const rest = list.filter((u) => u.at > time);
-			if (rest.length) s.undelegating![from] = rest; else { delete s.undelegating![from]; if (!Object.keys(s.undelegating!).length) delete s.undelegating; }
+			if (rest.length) s.undelegating![from] = rest; else { delete s.undelegating![from]; if (emptyOf(s.undelegating!)) delete s.undelegating; }
 			if (total > 0) add(s, from, NATIVE, total);
 		};
 	},
@@ -2153,7 +3010,9 @@ const HANDLERS: Record<string, Handler> = {
 		if (was && time - was.at < RULES.checkinGapMs) fail('this node checked in a moment ago');
 		// the hours it was seen in since the last pay day (one count per clock hour, however often it checks in)
 		const hr = Math.floor(time / 3_600_000), hrs = was?.hr === hr ? (was.hrs ?? 1) : (was?.hrs ?? 0) + 1;
-		return () => { (s.nodes ??= {})[from] = { ...(url === undefined ? {} : { url }), at: time, hr, hrs }; };
+		if (d.big !== undefined && !(s.heart && Number.isSafeInteger(d.big) && (d.big as number) >= HEART.sizeMin && (d.big as number) <= HEART.sizeMax)) fail('big: the biggest block this node takes, in bytes');
+		const seat = s.heart && url !== undefined ? seatFor(s, from, was, time) : undefined;
+		return () => { (s.nodes ??= {})[from] = { ...(url === undefined ? {} : { url }), at: time, hr, hrs, ...(s.heart ? clockAfter(s, was, time) : {}), ...(seat ? { seat } : {}), ...(d.big !== undefined ? { big: d.big as number } : {}) }; };
 	},
 	/** the crew upgrade: the share of its pay an operator keeps before its backers' share (basis points, 0 to 10,000) */
 	'stake.commission'(s, from, d) {
@@ -2187,16 +3046,17 @@ const HANDLERS: Record<string, Handler> = {
 			let backers = 0;
 			const m = s.delegations?.[v];
 			if (m) for (const k of Object.keys(m)) { const c = cut(m[k]); m[k] -= c; backers += c; if (!m[k]) delete m[k]; }
-			if (m && !Object.keys(m).length) { delete s.delegations![v]; if (!Object.keys(s.delegations!).length) delete s.delegations; }
+			if (m && !Object.keys(m).length) { delete s.delegations![v]; if (emptyOf(s.delegations!)) delete s.delegations; }
 			for (const list of Object.values(s.undelegating ?? {})) for (const u of list) if (u.v === v) { const c = cut(u.amount); u.amount -= c; backers += c; }
-			toTreasury(s, backers);
+			if (!s.heart?.proof) toTreasury(s, backers);
 			let left = penalty; // taken from the seat first, then from what is unlocking
 			const take = Math.min(st.bond, left); st.bond -= take; left -= take;
 			for (const u of st.unbonding ?? []) { const t = Math.min(u.amount, left); u.amount -= t; left -= t; }
 			if (st.unbonding) { st.unbonding = st.unbonding.filter((u) => u.amount > 0); if (!st.unbonding.length) delete st.unbonding; }
 			st.tomb = true; delete st.missed; delete st.jailed;
 			if (reward) add(s, from, NATIVE, reward);
-			toTreasury(s, penalty - reward);
+			if (s.heart?.proof) s.sun!.council.bonus += penalty - reward + backers; // the proof rules: the bonus, drawn among the honest
+			else toTreasury(s, penalty - reward);
 		};
 	},
 
@@ -2237,20 +3097,54 @@ const HANDLERS: Record<string, Handler> = {
 			p.votes = votes;
 			if (!passes) return;
 			s.treasury! -= p.amount; if (!s.treasury) delete s.treasury; add(s, p.to, NATIVE, p.amount);
-			delete s.proposals![key]; if (!Object.keys(s.proposals!).length) delete s.proposals;
+			delete s.proposals![key]; if (emptyOf(s.proposals!)) delete s.proposals;
 		};
 	},
 	/** anyone may clear away a proposal whose voting has ended without passing */
 	'treasury.close'(s, _from, d, _id, time) {
 		const key = s.proposals && own(s.proposals, d.id) ? d.id : fail('no such proposal');
 		if (time <= s.proposals![key].until) fail('voting on this proposal has not ended');
-		return () => { delete s.proposals![key]; if (!Object.keys(s.proposals!).length) delete s.proposals; };
+		return () => { delete s.proposals![key]; if (emptyOf(s.proposals!)) delete s.proposals; };
+	},
+
+	/* ---- contributors (the Heart upgrade): 10% of every fee waits here; whoever has stake proposes whom it pays ---- */
+	'grant.propose'(s, from, d, id, time) {
+		const h = s.heart ?? fail('grants start with the Heart upgrade');
+		for (const k of Object.keys(d)) if (!['to', 'asset', 'amount', 'reason'].includes(k)) fail(`"${k}" is not expected here`);
+		if (voteWeight(s, from) <= 0) fail('only someone with DZY staked or delegated can propose');
+		const to = isAddr(d.to) ? d.to : fail('bad receiver'), amount = amountOf(d.amount), asset = typeof d.asset === 'string' && (d.asset === NATIVE || own(X_COINS, d.asset)) ? d.asset : fail('asset: DZY, or a coin the exchange takes');
+		if (typeof d.reason !== 'string' || d.reason.trim().length < RULES.reasonMin || d.reason.length > RULES.reasonMax) fail('say what the payment is for');
+		if (Object.keys(h.props).length >= HEART.maxGrants) fail('too many proposals are open: wait for some to end');
+		const key = 'g' + id.slice(0, 16);
+		return () => { h.props[key] = { by: from, to, asset, amount, reason: d.reason as string, until: time + HEART.grantDays, votes: {} }; };
+	},
+	/** vote yes or no; the moment more than two thirds of all stake says yes, it is paid, if the contributors' fund holds enough */
+	'grant.vote'(s, from, d, _id, time) {
+		const h = s.heart ?? fail('grants start with the Heart upgrade'), key = own(h.props, d.id) ? d.id : fail('no such proposal'), p = h.props[key];
+		if (time > p.until) fail('voting on this proposal has ended');
+		if (typeof d.yes !== 'boolean') fail('vote yes: true or yes: false');
+		if (voteWeight(s, from) <= 0) fail('only someone with DZY staked or delegated can vote');
+		const votes = { ...p.votes, [from]: d.yes as boolean };
+		const yes = Object.entries(votes).filter(([, y]) => y).reduce((n, [a]) => n + voteWeight(s, a), 0);
+		const passes = yes * 3 > totalVoteWeight(s) * 2 && grantOf(h, p.asset) >= p.amount;
+		return () => {
+			p.votes = votes;
+			if (!passes) return;
+			delete h.props[key];
+			if (p.asset === NATIVE) { h.grants -= p.amount; add(s, p.to, NATIVE, p.amount); }
+			else { h.coin.g[p.asset] -= p.amount; if (!h.coin.g[p.asset]) delete h.coin.g[p.asset]; creditCoin(s, p.to, p.asset, p.amount); }
+		};
+	},
+	'grant.close'(s, _from, d, _id, time) {
+		const h = s.heart ?? fail('grants start with the Heart upgrade'), key = own(h.props, d.id) ? d.id : fail('no such proposal');
+		if (time <= h.props[key].until) fail('voting on this proposal has not ended');
+		return () => { delete h.props[key]; };
 	},
 
 	/* ---- contracts ---- */
 	/** put a program on the chain. Its address comes from this transaction; nobody holds a key for it. */
 	'contract.deploy'(s, from, d, _id, time, ctx) {
-		const prog = checkProgram(d.code);
+		const prog = checkProgram(d.code, !!s.heart);
 		if (canon(d.code).length > LIMITS.codeChars) fail(`a program is at most ${LIMITS.codeChars} characters`);
 		const gas = gasLimitOf(d);
 		const onCredit = !!s.sun && balanceOf(s, from, NATIVE) < RULES.deployFee && creditCovers(s, from, RULES.deployFee);
@@ -2307,7 +3201,7 @@ const HANDLERS: Record<string, Handler> = {
 		const holder = s.names && own(s.names, name) ? s.names[name] : null;
 		if (holder === from) fail('this account already has that name');
 		if (holder) fail('that name is taken');
-		// 1 to 3 characters: a premium name, paid in DZY at its dollar price, to the founder (who can also give one: name.grant)
+		// 1 to 3 characters: a premium name, paid in DZY at its dollar price, to the fee account (who can also give one: name.grant)
 		const usd = v2 && name.length <= 3 ? premiumNameUsd(s, name.length) : 0;
 		if (usd) {
 			const cost = usdCost(s, NATIVE, usd) ?? fail('premium names open once DZY has a price');
@@ -2338,11 +3232,11 @@ const HANDLERS: Record<string, Handler> = {
 		if (!(a.links && own(a.links, net)) && Object.keys(a.links ?? {}).length >= RULES.maxLinks) fail('too many links');
 		return () => { (a.links ??= {})[net] = d.address as string; };
 	},
-	/** the founder gives a premium name (1 to 3 characters, sold or gifted off the chain) to an account; it replaces
+	/** the fee account gives a premium name (1 to 3 characters, sold or gifted off the chain) to an account; it replaces
 	    that account's name, if it had one */
 	'name.grant'(s, from, d, _id, _t, ctx) {
 		if (!namesV2On(s, ctx.height)) fail('premium names are not open yet');
-		if (from !== RULES.saleFeeTo && from !== s.authority) fail('only the founder gives premium names');
+		if (from !== RULES.saleFeeTo && from !== s.authority) fail('only the fee account gives premium names');
 		const name = typeof d.name === 'string' && isNameV2(d.name) && d.name.length <= 3 ? d.name : fail('a premium name is 1 to 3 small letters or digits');
 		const to = typeof d.to === 'string' && /^[0-9a-f]{64}$/.test(d.to) ? d.to : fail('to: the account that gets the name');
 		if (s.names && own(s.names, name)) fail('that name is taken');
@@ -2350,7 +3244,7 @@ const HANDLERS: Record<string, Handler> = {
 	},
 	'name.release'(s, from) {
 		const a = existing(s, from), name = a.name ?? fail('this account has no name');
-		return () => { delete s.names![name]; if (!Object.keys(s.names!).length) delete s.names; delete a.name; };
+		return () => { delete s.names![name]; if (emptyOf(s.names!)) delete s.names; delete a.name; };
 	},
 
 	/* ---- several keys must agree ---- */
@@ -2479,7 +3373,7 @@ function makeSession(s: State, time: number, height: number, readonly: boolean, 
 			get: (k) => (store.has(k) ? store.get(k) : own(c.storage, k) ? c.storage[k] : undefined),
 			set: (k, v) => { if (w.get(k) === undefined) entries.set(at, count(at) + 1); store.set(k, v); },
 			del: (k) => { if (w.get(k) !== undefined) entries.set(at, count(at) - 1); store.set(k, undefined); },
-			entries: () => count(at),
+			entries: () => count(at), maxEntries: s.heart ? LIMITS.heartEntries : LIMITS.entries, layerRoot: (id) => layerRoot(s, id, time),
 			balance: bal,
 			transfer: (asset, to, amount) => {
 				if (!assetAt(asset)) fail('no such asset');
@@ -2573,12 +3467,12 @@ function payOut(s: State, id: string, ch: Channel, a: number, b: number) {
 	if (a) add(s, ch.a, ch.asset, a);
 	if (b) add(s, ch.b, ch.asset, b);
 	delete s.channels![id];
-	if (!Object.keys(s.channels!).length) delete s.channels;
+	if (emptyOf(s.channels!)) delete s.channels;
 }
 /* ---- hash locks: helpers ---- */
 function closeSwap(s: State, key: string, done: SwapDone) {
 	delete s.swaps![key];
-	if (!Object.keys(s.swaps!).length) delete s.swaps;
+	if (emptyOf(s.swaps!)) delete s.swaps;
 	s.swapLog = [...(s.swapLog ?? []), done].slice(-RULES.maxSwapLog);
 }
 
@@ -2616,7 +3510,7 @@ function settle(s: State, pos: Position, time: number, partial = false, rewardCa
 			if (reward > 0) add(s, closer, NATIVE, reward);
 			if (left > 0) add(s, pos.owner, NATIVE, left);
 			delete s.positions![key];
-			if (!Object.keys(s.positions!).length) delete s.positions;
+			if (emptyOf(s.positions!)) delete s.positions;
 		}
 	};
 }
@@ -2633,7 +3527,7 @@ function tidyStake(s: State, addr: string) {
 	const st = s.stakes?.[addr];
 	if (st && !st.bond && !st.unbonding && !st.tomb && st.jailed === undefined) {
 		delete s.stakes![addr];
-		if (!Object.keys(s.stakes!).length) delete s.stakes;
+		if (emptyOf(s.stakes!)) delete s.stakes;
 	}
 }
 function voteOf(v: unknown): SignedVote {
@@ -2680,6 +3574,8 @@ export interface XState { vaults: Record<string, number>; prices?: Record<string
 	/** coin locked in its buyer's own name ("address:COIN" -> units): only that address can close it */ locks?: Record<string, number>;
 	/** the exchange's own coin (COIN -> units): lock leftovers and the exchange's fees. Nobody owns it; it only ever pays out at the floor */ pot?: Record<string, number>;
 	/** addresses whose deposits stay free coin instead of buying DZY */ park?: Record<string, 1>;
+	/** the block the index turned on (DZY priced by the reserve), its last price (µ$), and the DZY in hands still not backed (early DZY, washed by fees) */ index?: number; nav?: number; unbacked?: number;
+	/** coins voted out of the reserve ('out': swapped out for good coins) or counted as nothing ('zero'), and the votes on the way */ retired?: Record<string, 'out' | 'zero'>; rvotes?: Record<string, string[]>;
 	/** Dznye dollar loans (DUSD): id -> the loan */ loans?: Record<string, Loan>; /** vaults the validators listed (x.vault): network -> "address" or "address@block" */ listed?: Record<string, string> }
 /** A Dznye dollar loan: `coll` of a vault coin's free coin held by the loan; `debt` DUSD borrowed (millionths of a dollar);
     `fee` the interest and borrowing fee owed so far (µ$), counted up to `at` */
@@ -2699,6 +3595,9 @@ export const X_COINS: Readonly<Record<string, { decimals: number; nets: readonly
 	BNB: { decimals: 9, nets: ['bsc'], name: 'BNB' },
 	POL: { decimals: 9, nets: ['polygon'], name: 'Polygon' },
 	AVAX: { decimals: 9, nets: ['avax'], name: 'Avalanche' },
+	// gold (from GOLD_FROM): one troy ounce each, held in the Ethereum vault; PAXG counted in billionths of an ounce, XAUT in millionths (its own)
+	PAXG: { decimals: 9, nets: ['eth'], name: 'PAX Gold' },
+	XAUT: { decimals: 6, nets: ['eth'], name: 'Tether Gold' },
 });
 /* ---------- more coins and networks (2026-11-19, the owner: "buy DZY from every chain") ----------
    Tether on six networks, USDC on BNB Chain, and BNB, POL and AVAX, each paid into the same vault contract on its own
@@ -2716,6 +3615,7 @@ export const xMoreFrom = (chain: string) => TEST_X_MORE.get(chain) ?? (Object.ha
 /** does this coin (on this network) count at this block? */
 export const xLive = (s: State, coin: string, net?: string, height: number = s.height + 1): boolean => {
 	if (!own(X_COINS, coin) || (net !== undefined && !X_COINS[coin].nets.includes(net))) return false;
+	if (GOLD.has(coin) && height < goldFrom(s.chain)) return false; // gold counts from its block
 	if (height >= xMoreFrom(s.chain)) return true;
 	return own(X_FIRST, coin) && (net === undefined || X_FIRST[coin].includes(net));
 };
@@ -2726,8 +3626,9 @@ export const X_LIMITS: Readonly<Record<string, { deposit: number; vault: number 
 	SOL: { deposit: 20_000_000_000, vault: 200_000_000_000 }, USDC: { deposit: 1_000_000_000, vault: 10_000_000_000 },
 	USDT: { deposit: 1_000_000_000, vault: 10_000_000_000 }, BNB: { deposit: 3_000_000_000, vault: 30_000_000_000 },
 	POL: { deposit: 5_000_000_000_000, vault: 50_000_000_000_000 }, AVAX: { deposit: 50_000_000_000, vault: 500_000_000_000 },
+	PAXG: { deposit: 1_000_000_000, vault: 10_000_000_000 }, XAUT: { deposit: 1_000_000, vault: 10_000_000 }, // an ounce a deposit, ten in the vault
 });
-/* the starting limits lifted (2026-11-21, the owner's choice): from this block on mainnet a deposit is never held back for
+/* the starting limits lifted (2026-11-21): from this block on mainnet a deposit is never held back for
    its size or for how full the vault is; every block before it replays under the limits as they were, so a node that has
    not updated agrees with every block until it. Other chains keep the limits. What stays: the sale's own end (3,000,000
    DZY), the need for an agreed coin price, and "park". */
@@ -2748,6 +3649,15 @@ export function testExchangeFrom(chain: string, height: number | null) { if (hei
 export const exchangeFrom = (chain: string) => TEST_X.get(chain) ?? (Object.hasOwn(X_FROM, chain) ? X_FROM[chain] : Infinity);
 /** is the exchange open (on a chain with the Sun)? From then on nobody buys DZY by burning money */
 export const exchangeOn = (s: State, height: number = s.height + 1) => !!s.sun && height >= exchangeFrom(s.chain);
+/* Closing a lock on the curve (found 22 Nov 2026). Until this block, closing priced the whole lock at the curve's price at
+   the top, while buying it had walked the curve up: a deposit closed at once came back less 0.1% and left DZY over for
+   nothing ($10,000 round left 4,271 DZY). From it, closing walks the same curve back down. No lock had ever been closed
+   on the live chain before it, so every block replays the same. Other chains: from the start, unless set. */
+const CLOSE_FROM: Record<string, number> = { 'dznye-mainnet': 8_300 };
+const TEST_CLOSE = new Map<string, number>();
+/** TEST ONLY: the block a test chain closes locks on the curve from (null: back to the rule) */
+export function testCloseFrom(chain: string, height: number | null) { if (height === null) TEST_CLOSE.delete(chain); else TEST_CLOSE.set(chain, height); }
+export const closeOnCurve = (s: State, height: number = s.height + 1) => height >= (TEST_CLOSE.get(s.chain) ?? (own(CLOSE_FROM, s.chain) ? CLOSE_FROM[s.chain] : 0));
 const xOf = (s: State) => (s.x ??= { vaults: {}, free: {} });
 const xCoinOf = (s: State, c: unknown): string => (typeof c === 'string' && xLive(s, c) ? c : fail('no such coin on the exchange'));
 const xNetOf = (s: State, coin: string, n: unknown): string => (typeof n === 'string' && xLive(s, coin, n) ? n : fail(`${coin} is paid out on ${X_COINS[coin].nets.filter((x) => xLive(s, coin, x)).join(', ')}`));
@@ -2782,30 +3692,37 @@ function roundOf(s: State, d: Record<string, unknown>) {
 	return { key, r, start, end: start + period };
 }
 const marketOf = (s: State, id: unknown): Market => (s.markets && typeof id === 'string' && own(s.markets, id) ? s.markets[id] : fail('no such market'));
-const loanOf = (s: State, id: unknown): Loan => (s.x?.loans && typeof id === 'string' && own(s.x.loans, id) ? s.x.loans[id] : fail('no such loan'));
+const loanOf = (s: State, id: unknown): Loan => (loansOfX(s) && typeof id === 'string' && own(loansOfX(s)!, id) ? loansOfX(s)![id] : fail('no such loan'));
 const dusdText = (n: number) => (n / 1e6).toLocaleString('en-US', { maximumFractionDigits: 6 });
 /** a loan closing: its fee taken from its coin to the pot, then the rest to `to` as free coin (price only needed if a fee is owed) */
 function loanSettle(s: State, id: string, fee: number, price: number | null, to: string) {
-	const l = s.x!.loans![id], feeCoin = fee && price ? Math.min(l.coll, coinFor(l.coin, B(fee), price, true)) : 0;
-	potAdd(s, l.coin, feeCoin);
+	const l = loansOfX(s)![id], feeCoin = fee && price ? Math.min(l.coll, coinFor(l.coin, B(fee), price, true)) : 0;
+	potAdd(s, l.coin, coinFee(s, l.coin, feeCoin));
 	claimAsset(s, l.coin).supply -= feeCoin; // fee coin leaves the free coin for the pot
 	if (l.coll - feeCoin > 0) add(s, to, 'x' + l.coin, l.coll - feeCoin);
-	delete s.x!.loans![id];
+	delete loansOfX(s)![id];
 }
 /** an account's Dznye dollar loans, each with its fee so far and its health (value ÷ what it owes, in %; null with no price) */
 export function loansOf(s: State, who: string, time: number = s.time) {
-	return Object.entries(s.x?.loans ?? {}).filter(([, l]) => l.owner === who).map(([id, l]) => {
+	return Object.entries(loansOfX(s) ?? {}).filter(([, l]) => l.owner === who).map(([id, l]) => {
 		const fee = loanFee(l, time), price = xPrice(s, l.coin, time), owes = l.debt + fee;
 		return { id, ...l, fee, price, health: price === null ? null : owes ? N((collUsd(l.coin, l.coll, price) * 10_000n) / B(owes)) / 100 : null, max: price === null ? null : loanMax(l.coin, l.coll, price) };
 	});
 }
 export function xFloor(s: State, time: number = s.time): { usd: bigint; hands: bigint; perDzy: number } | null {
 	let usd = 0n;
-	for (const [c, n] of Object.entries(s.x?.pot ?? {})) { if (!n) continue; const p = xPrice(s, c, time); if (p === null) return null; usd += (B(n) * B(p)) / 10n ** B(X_COINS[c].decimals); }
-	const v = sunSupply(s), hands = B(v.supply - v.sun - v.unsold);
+	for (const [c, n] of Object.entries(s.x?.pot ?? {})) {
+		if (!n || retiredOf(s, c) === 'zero') continue; // voted worthless: counts nothing
+		const p = xPrice(s, c, time);
+		if (p === null) { if (indexOn(s) && priceGone(s, c, time)) continue; return null; } // gone a day: nothing; else wait for its price
+		usd += (B(n) * B(p)) / 10n ** B(X_COINS[c].decimals);
+	}
+	const hands = B(SUN_SUPPLY - (s.treasury ?? 0) - s.sun!.salePot); // (not sunSupply: it asks the price, which asks this)
 	if (hands <= 0n) return null;
 	return { usd, hands, perDzy: N((usd * B(DZY)) / hands) };
 }
+/** coin the chain owes `who` becomes their free coin (the Heart upgrade pays the exchange's fees out this way) */
+export function creditCoin(s: State, who: string, coin: string, n: number) { if (n > 0) { const c = claimAsset(s, coin); c.supply += n; c.minted += n; add(s, who, 'x' + coin, n); } }
 /** the claims on a coin: a token the chain makes and nobody can issue, one unit per unit of coin held for its holder */
 function claimAsset(s: State, coin: string): Asset {
 	const id = 'x' + coin;
@@ -2815,12 +3732,12 @@ function claimAsset(s: State, coin: string): Asset {
 /** the agreed price of a coin now, in µ$ per whole coin, or null */
 export function xPrice(s: State, coin: string, time: number = s.time): number | null {
 	const w = powers(s), all = Object.values(w).reduce((n, v) => n + v, 0), got: number[] = [];
-	let say = 0;
+	let say = 0; const by: string[] = [];
 	for (const [v, r] of Object.entries(s.x?.prices ?? {})) {
-		if (!s.validators.includes(v) || time - r.at > X_PRICE_AGE || !own(r.p, coin)) continue;
-		got.push(r.p[coin]); say += w[v] ?? 0;
+		if (!mayVouch(s, v) || time - r.at > X_PRICE_AGE || !own(r.p, coin)) continue;
+		got.push(r.p[coin]); say += w[v] ?? 0; by.push(v);
 	}
-	if (!got.length || say * 3 <= all * 2) return null;
+	if (!got.length || say * 3 <= all * 2 || !vouched(s, by)) return null;
 	got.sort((a, b) => a - b);
 	if (BigInt(got[got.length - 1]) * 10_000n > BigInt(got[0]) * BigInt(10_000 + X_PRICE_SPREAD_BP)) return null;
 	return got[Math.floor((got.length - 1) / 2)];
@@ -2839,20 +3756,27 @@ export const exchangeVaults = (s: State): Record<string, string> => Object.fromE
 /** the block a vault on an Ethereum-style network was deployed at, if listed */
 export const exchangeVaultFrom = (s: State, net: string): number | undefined => { const v = vaultList(s)[net], b = v?.split('@')[1]; return b && /^\d+$/.test(b) ? Number(b) : undefined; };
 /** what the exchange looks like now (GET /exchange): anyone can check every vault against every claim */
+/** the index as anyone may see it: on since which block, the price, what the reserve holds and is worth, the DZY in hands
+    and how many of them are still unbacked (early DZY, washed by fees), and the part of every fee that washes */
+export function indexView(s: State) {
+	const f = xFloor(s), from = indexFrom(s.chain);
+	const held = Object.entries(s.x?.pot ?? {}).filter(([, n]) => n > 0).map(([coin, units]) => { const p = xPrice(s, coin); return { coin, units, usd: p === null ? null : N((B(units) * B(p)) / 10n ** B(X_COINS[coin].decimals)) }; });
+	return { retired: s.x?.retired ?? {}, from: Number.isFinite(from) ? from : null, on: s.x?.index ?? null, price: indexOn(s) ? indexPrice(s) ?? s.x?.nav ?? null : null, reserveUsd: f ? N(f.usd) : null, hands: f ? N(f.hands) : null, unbacked: s.x?.unbacked ?? 0, feeBps: RULES.xFeeBps, washBp: N(WASH_BP), held };
+}
 export function exchangeView(s: State) {
 	const from = exchangeFrom(s.chain), vaults = exchangeVaults(s);
 	const coins = Object.fromEntries(Object.entries(X_COINS).filter(([c]) => xLive(s, c)).map(([c, k0]) => {
 		const k = { ...k0, nets: k0.nets.filter((n) => xLive(s, c, n)) }; // only what counts now
 		const held = Object.fromEntries(k.nets.map((n) => [n, s.x?.vaults[`${n}:${c}`] ?? 0])), total = Object.values(held).reduce((a, b) => a + b, 0);
-		const claims = s.assets['x' + c]?.supply ?? 0, locked = Object.entries(s.x?.locks ?? {}).filter(([q]) => q.endsWith(':' + c)).reduce((n, [, v]) => n + v, 0);
-		return [c, { name: k.name, decimals: k.decimals, nets: k.nets, vaults: Object.fromEntries(k.nets.filter((n) => own(vaults, n)).map((n) => [n, vaults[n]])), held, total, claims, locked, pot: s.x?.pot?.[c] ?? 0, price: xPrice(s, c), limits: xUnlimited(s) ? {} : X_LIMITS[c] }];
+		const claims = s.assets['x' + c]?.supply ?? 0, locked = Object.entries(locksOfX(s) ?? {}).filter(([q]) => q.endsWith(':' + c)).reduce((n, [, v]) => n + v, 0);
+		return [c, { name: k.name, decimals: k.decimals, nets: k.nets, vaults: Object.fromEntries(k.nets.filter((n) => own(vaults, n)).map((n) => [n, vaults[n]])), held, total, claims, locked, pot: s.x?.pot?.[c] ?? 0, ...(s.heart ? { fees: heartCoin(s)[c] ?? 0 } : {}), price: xPrice(s, c), limits: xUnlimited(s) ? {} : X_LIMITS[c] }];
 	}));
 	const f = xFloor(s), btc = xPrice(s, 'BTC');
 	const floor = f ? { usd: f.perDzy, sats: btc ? N((B(f.perDzy) * 100_000_000n) / B(btc)) : null } : null;
-	const dzyUsd = s.sun ? N(salePrice(V2, B(s.sun.sold))) : null;
+	const dzyUsd = s.sun ? spotPrice(s) : null;
 	const pays = Object.entries(s.xpays ?? {}).slice(-50).map(([id, p]) => ({ id, ...p }));
-	return { open: exchangeOn(s), from: Number.isFinite(from) ? from : null, feeBps: RULES.xFeeBps, tradeFeeBps: RULES.xTradeBps, priceMaxAgeMs: X_PRICE_AGE, priceMaxSpreadBp: X_PRICE_SPREAD_BP, dzyPrice: dzyUsd, dzySats: dzyUsd !== null && btc ? N((B(dzyUsd) * 100_000_000n) / B(btc)) : null, btcUsd: btc, floor, coins, payouts: pays,
-		dusd: { owed: s.assets.DUSD?.supply ?? 0, loans: Object.keys(s.x?.loans ?? {}).length, rateBps: RULES.loanRateBps, openBps: RULES.loanOpenBps, minBps: RULES.loanMinBps, liqBps: RULES.loanLiqBps, bonusBps: RULES.loanBonusBps } };
+	return { open: exchangeOn(s), checkoutVault: checkoutV2(s), btcOrders: orderBtcOn(s), reserve: { open: reserveOn(s), from: Number.isFinite(reserveFrom(s.chain)) ? reserveFrom(s.chain) : null }, index: indexView(s), wdzy: { open: wdzyOn(s), mint: wdzyMint(s.chain), held: s.wdzy?.held ?? 0, cap: wdzyCap(s.chain) }, nftItems: { open: nftItemsOn(s), from: Number.isFinite(nftItemsFrom(s.chain)) ? nftItemsFrom(s.chain) : null }, resale: { open: resaleOn(s), from: Number.isFinite(resaleFrom(s.chain)) ? resaleFrom(s.chain) : null, ...RESALE }, fee: { bps: feeBpsOf(s), to: RULES.saleFeeTo }, from: Number.isFinite(from) ? from : null, feeBps: RULES.xFeeBps, tradeFeeBps: RULES.xTradeBps, priceMaxAgeMs: X_PRICE_AGE, priceMaxSpreadBp: X_PRICE_SPREAD_BP, dzyPrice: dzyUsd, dzySats: dzyUsd !== null && btc ? N((B(dzyUsd) * 100_000_000n) / B(btc)) : null, btcUsd: btc, floor, coins, payouts: pays,
+		dusd: { owed: s.assets.DUSD?.supply ?? 0, loans: keysOf(loansOfX(s) ?? {}).length, rateBps: RULES.loanRateBps, openBps: RULES.loanOpenBps, minBps: RULES.loanMinBps, liqBps: RULES.loanLiqBps, bonusBps: RULES.loanBonusBps } };
 }
 
 /* ---------- the crew upgrade (2026-11-17) ----------
@@ -2919,6 +3843,7 @@ export const isStaker = (s: State, addr: string) => {
     chain's starting validators). From then on: the most-staked keys, up to maxValidators, in address order. The set
     is never left empty: with no staker left, it stays as it was. */
 export function nextValidators(s: State, height: number = s.height + 1, time: number = s.time): { validators: string[]; staked: boolean } {
+	if (s.heart) return nextHeartCrew(s, time);
 	if (crewOn(s, height)) return nextCrew(s, time);
 	const cands = Object.keys(s.stakes ?? {}).filter((a) => isStaker(s, a))
 		.sort((x, y) => weightOf(s, y) - weightOf(s, x) || (x < y ? -1 : 1))
@@ -2937,6 +3862,16 @@ function nextCrew(s: State, time: number): { validators: string[]; staked: boole
 	const epoch = Math.floor(time / RULES.crewEveryMs);
 	if (s.crew && s.crew.epoch === epoch && s.crew.validators.every((v) => isCandidate(s, v))) return { validators: s.crew.validators, staked: true };
 	s.crew = { epoch, ...drawCrew(s, online, epoch) };
+	return { validators: s.crew.validators, staked: true };
+}
+/** the Heart upgrade's crew (heart.ts): drawn once a period by stake x time, or at once when a member may not serve any more */
+function nextHeartCrew(s: State, time: number): { validators: string[]; staked: boolean } {
+	const epoch = Math.floor(time / RULES.crewEveryMs), was = s.crew;
+	if (was?.seed !== undefined && was.epoch === epoch && was.validators.every((v) => isCandidate(s, v))) return { validators: was.validators, staked: !!s.staked };
+	// the starting validators of a chain where staking has not begun: they carry on, one say each, until one of them stakes
+	const drawn = Object.keys(s.stakes ?? {}).some((a) => s.heart!.anchors.includes(a) && isCandidate(s, a)) || s.staked ? drawHeartCrew(s, time, epoch) : null;
+	if (!drawn) { delete s.crew; return { validators: s.validators, staked: !!s.staked }; }
+	s.crew = { epoch, ...drawn };
 	return { validators: s.crew.validators, staked: true };
 }
 /** Each validator's say in agreement. Before staking takes over: one each. After: the whole DZY it has staked, so
@@ -2969,14 +3904,17 @@ export function endBlock(s: State, height: number, round: number, proposer: stri
 		if (st?.missed) delete st.missed;
 		if (round > 0 && round < 2 * n) {
 			const missed = new Set<string>();
-			for (let k = 0; k < round; k++) missed.add(vs[(height + k) % n]);
+			const pw = s.heart ? powers(s) : null;
+			for (let k = 0; k < round; k++) missed.add(pw ? turnFor(vs, pw, s.crew?.seed ?? '', height, k) : vs[(height + k) % n]);
 			missed.delete(proposer);
-			for (const v of missed) { const m = own(s.stakes, v) ? s.stakes[v] : null; if (m && !m.tomb) m.missed = (m.missed ?? 0) + 1; }
+			for (const v of missed) { const m = own(s.stakes, v) ? s.stakes[v] : null; if (m && !m.tomb) { m.missed = (m.missed ?? 0) + 1; if (s.heart) missedTurn(s, v); } }
 			// bench at most one validator per block, and never the last one
-			const out = [...missed].sort().find((v) => own(s.stakes!, v) && (s.stakes![v].missed ?? 0) >= RULES.missLimit && s.stakes![v].jailed === undefined);
+			const out = [...missed].sort().find((v) => own(s.stakes!, v) && (s.stakes![v].missed ?? 0) >= (s.heart ? HEART.missLimit : RULES.missLimit) && s.stakes![v].jailed === undefined && (!s.heart || benchable(s, v)));
 			if (out && n > 1) s.stakes[out].jailed = time + RULES.jailTime;
 		}
 	}
+	const heartWas = !!s.heart; startHeart(s, height, time); if (s.heart && !heartWas) startLists(s); startTime(s, height); startProof(s, height); startFuture(s, height);
+	indexBlock(s, height, time); // the index: turns on at its block, then keeps its last price
 	const next = nextValidators(s, height, time);
 	s.validators = next.validators;
 	if (next.staked) s.staked = true;
@@ -2997,15 +3935,21 @@ export async function applyTx(s: State, tx: Tx, time: number = s.time, proposer?
 	if (typeof tx.sig !== 'string') fail('missing signature');
 	if (tx.payer !== undefined && (!isAddr(tx.payer) || tx.payer === tx.from)) fail('bad payer');
 	if (tx.payer === undefined && tx.payerSig !== undefined) fail('bad payer');
+	if (tx.tip !== undefined || tx.max !== undefined) {
+		if (!s.heart?.fut) fail('tips and limits are not open on this chain yet');
+		if (tx.tip !== undefined && !(Number.isSafeInteger(tx.tip) && tx.tip > 0 && tx.tip <= 1e13)) fail('tip: whole shards, above nothing');
+		if (tx.max !== undefined && !(Number.isSafeInteger(tx.max) && tx.max > 0)) fail('max: the most fee, in whole shards');
+	}
 	const msg = txMessage(tx);
-	if (msg.length > (tx.type === 'contract.deploy' ? RULES.maxDeployChars : tx.type === 'transfer.many' ? RULES.maxBatchChars : RULES.maxTxChars)) fail('transaction too big');
+	if (msg.length > (tx.type === 'contract.deploy' ? RULES.maxDeployChars : tx.type === 'transfer.many' ? RULES.maxBatchChars : tx.type === 'evm.run' && s.heart ? EVM_RULES.maxRaw + 1_000 : tx.type === 'x.prove' && s.heart?.proof ? RULES.maxBtcChars + 3_000 : tx.type === 'q.run' && s.heart?.fut ? FUTURE.qChars : (tx.type.startsWith('layer.') || tx.type.startsWith('blob.')) && s.heart ? RULES.maxProofChars : RULES.maxTxChars)) fail('transaction too big');
 	if (!(await verify(tx.signer ?? tx.from, msg, tx.sig))) fail('bad signature');
 	if (tx.payer !== undefined && (typeof tx.payerSig !== 'string' || !(await verify(tx.payer, payerMessage(tx), tx.payerSig)))) fail('bad payer signature');
 	if (tx.type === 'evidence') { // a proof of cheating: both votes must really carry that validator's signature
 		for (const v of [voteOf(tx.data.a), voteOf(tx.data.b)]) if (!(await verify(v.validator, voteMessage(s.chain, v.type, v.height, v.round, v.block), v.sig))) fail('a vote in that proof is not signed by that validator');
 	}
 	const id = await sha256(msg);
-	const ctx: Ctx = { height: s.height + 1, payer: tx.payer ?? tx.from };
+	if (tx.side !== undefined && (tx.type !== 'blob.part' || !s.heart || typeof tx.side !== 'string' || tx.side.length > RULES.maxPartChars)) fail('only a file\'s part brings bytes beside it');
+	const ctx: Ctx = { height: s.height + 1, payer: tx.payer ?? tx.from, ...(tx.side === undefined ? {} : { side: tx.side }) };
 	// co-signatures: other keys agreeing to exactly this transaction (for accounts that need several keys)
 	const cosigners = new Set<string>();
 	if (tx.cosigs !== undefined) {
@@ -3021,6 +3965,10 @@ export async function applyTx(s: State, tx: Tx, time: number = s.time, proposer?
 	if (tx.type === 'task.claim' && typeof tx.data.id === 'string' && typeof tx.data.to === 'string' && typeof tx.data.sig === 'string') {
 		const q = s.tasks && own(s.tasks, tx.data.id) ? s.tasks[tx.data.id] : null;
 		ctx.taskOk = !!q && (await verify(q.checker, taskMessage(s.chain, tx.data.id, tx.data.to), tx.data.sig));
+	}
+	if ((tx.type === 'layer.prove' || tx.type === 'layer.force') && s.heart && tx.data.op && typeof tx.data.op === 'object') { // a layer's step: its owner's signature
+		const seen = tx.type === 'layer.force' ? { fo: tx.from } : (tx.data.seen as { fo?: unknown } | undefined);
+		try { const op = checkOp(tx.data.op); if (op.k !== 'd' && typeof tx.data.id === 'string' && isOwner(seen?.fo)) ctx.stepSig = await verify(seen!.fo as string, opMessage(s.chain, tx.data.id, op), op.sig); } catch { /* the handler says why */ }
 	}
 	if (tx.type === 'gift.claim' && typeof tx.data.id === 'string' && typeof tx.data.to === 'string' && typeof tx.data.sig === 'string') {
 		const g = s.gifts && own(s.gifts, tx.data.id) ? s.gifts[tx.data.id] : null;
@@ -3056,6 +4004,8 @@ export async function applyTx(s: State, tx: Tx, time: number = s.time, proposer?
 		if (acct.multi.keys.includes(tx.signer ?? tx.from)) signed.add(tx.signer ?? tx.from);
 		if (signed.size < acct.multi.need) fail(`this account needs ${acct.multi.need} of its ${acct.multi.keys.length} keys to sign; ${signed.size} did`);
 	}
+	if (acct?.q?.only) fail('this account moves only by its hash key (q.run)');
+	if (tx.payer !== undefined && own(s.accounts, tx.payer) && s.accounts[tx.payer].q?.only) fail('that payer moves only by its hash key');
 	if (tx.payer !== undefined && own(s.accounts, tx.payer) && s.accounts[tx.payer].multi) fail('an account that needs several keys cannot pay others\' fees');
 	const next = nonceOf(s, tx.from) + 1;
 	if (tx.nonce !== next) fail(`nonce must be ${next}`);
@@ -3063,40 +4013,48 @@ export async function applyTx(s: State, tx: Tx, time: number = s.time, proposer?
 	/* The fee: taken from the payer (the sender, unless another account signed to pay it). It is taken before the
 	   transaction's own checks so they see what is left (sending your whole DZY balance leaves nothing for the fee),
 	   and given back exactly if the transaction is refused, so a refused transaction still leaves no trace. */
-	const payer = tx.payer ?? tx.from, base = feeFor(s, tx);
+	const payer = tx.payer ?? tx.from, tip = tx.tip ?? 0, base = feeFor(s, tx) + tip;
+	if (tx.max !== undefined && base > tx.max) fail(`the fee is ${base} now, above its limit of ${tx.max}: it waits for a quieter moment`);
 	// free transactions: a partner shop's monthly allowance first, else the daily share of a locker (by DZY locked)
-	const partnerOk = base > 0 && base === (s.fee ?? 0) && partnerFreeLeft(s, payer, time) > 0;
-	const lockOk = !partnerOk && !!s.sun && base > 0 && base === (s.fee ?? 0) && lockFreeLeft(s, payer) > 0;
+	const partnerOk = !tip && base > 0 && base === (s.fee ?? 0) && partnerFreeLeft(s, payer, time) > 0;
+	const lockOk = !tip && !partnerOk && !!s.sun && base > 0 && base === (s.fee ?? 0) && lockFreeLeft(s, payer) > 0;
 	const waived = partnerOk || lockOk;
 	const fee = waived ? 0 : base;
 	const payerAcct = own(s.accounts, payer) ? s.accounts[payer] : null;
 	if (tx.payer !== undefined && payerAcct?.off) fail('the payer\'s key is switched off');
 	// on a chain with the Sun, a new or tiny account's fee is paid by the Sun, within its welcome budget
-	const bySun = !!s.sun && tx.payer === undefined && sunPays(s, payer, fee);
+	const entries = s.heart ? newEntries(s, tx) : 0; // counted before anything changes
+	const bySun = !tip && !!s.sun && tx.payer === undefined && sunPays(s, payer, fee, entries > 0);
 	if (fee && !bySun && agent && tx.payer === undefined && fee > (agent.fees ?? 0)) fail('this agent key has no allowance left for fees');
 	let before = 0;
 	const takes = fee > 0 && !bySun;
+	const fromTrade = takes && tx.payer === undefined && !agent && s.heart && indexOn(s) ? feeFromTrade(s, tx, payer, fee) : null; // the fee from the trade itself
+	const data = fromTrade?.data ?? tx.data;
 	if (takes) {
-		if (balanceOf(s, payer, NATIVE) < fee) fail(tx.payer === undefined ? `every transaction costs a fee of ${fee} DZY parts; this account does not hold enough` : 'the payer does not hold enough DZY for the fee');
+		if (balanceOf(s, payer, NATIVE) < fee) { fromTrade?.undo(); fail(tx.payer === undefined ? `every transaction costs a fee of ${fee} DZY parts; this account does not hold enough` : 'the payer does not hold enough DZY for the fee'); }
 		before = payerAcct!.bal[NATIVE];
 		if (s.sun) payerAcct!.bal[NATIVE] = before - fee; // only for the checks below; taken for real once they pass
 		else sub(s, payer, NATIVE, fee);
 	}
+		ctx.fee = bySun ? 0 : fee; // (a fee the Sun paid is nobody's to get back)
 	let commit: () => void;
-	try { commit = HANDLERS[tx.type](s, tx.from, tx.data, id, time, ctx); } catch (e) {
+	try { commit = HANDLERS[tx.type](s, tx.from, data, id, time, ctx); } catch (e) {
 		if (takes) payerAcct!.bal[NATIVE] = before;
+		fromTrade?.undo();
 		throw e;
 	}
-	if (s.sun) { if (takes) payerAcct!.bal[NATIVE] = before; sunCharge(s, tx.from, payer, fee, bySun); } // the sender renews; the fee waits in the profit pot
+	if (s.sun) { if (takes) payerAcct!.bal[NATIVE] = before; sunCharge(s, tx.from, payer, fee, bySun, entries > 0); } // the sender renews; the fee waits in the profit pot
 	account(s, tx.from).nonce = tx.nonce;
 	commit();
+	if (entries) keptAdd(s, entries * KEPT.entryBytes);
+	if (ctx.gasUsed !== undefined) workAdd(s, ctx.gasUsed, roomOf(s).gas); // a contract's work fills the block as bytes do
 	if (lockOk) lockFreeUse(s, payer);
 	if (partnerOk && s.shops && own(s.shops, payer)) { const sh = s.shops[payer], period = Math.floor(time / PERIOD); sh.free = [period, (sh.free && sh.free[0] === period ? sh.free[1] : 0) + 1]; }
 	// a contract pays only for the gas it used: the rest of what it put up comes back to whoever paid
 	let used = fee;
 	if (s.sun) {
 		// a contract pays only for the gas it used: the rest goes back to whoever paid (the Sun, if it did)
-		if (fee && ctx.gasUsed !== undefined) { used = Math.min(fee, gasFee(s, ctx.gasUsed)); if (fee - used) { if (bySun) { s.sun.feePot -= fee - used; toSun(s, fee - used); } else sunRefund(s, payer, fee - used); } }
+		if (fee && ctx.gasUsed !== undefined) { used = Math.min(fee, gasFee(s, ctx.gasUsed) + sizeExtra(s, tx) + tip); if (fee - used) { if (bySun) { s.sun.feePot -= fee - used; toSun(s, fee - used); } else sunRefund(s, payer, fee - used); } }
 	} else {
 		if (fee && ctx.gasUsed !== undefined) { used = Math.min(fee, gasFee(s, ctx.gasUsed)); if (fee - used) add(s, payer, NATIVE, fee - used); }
 		// a staked validator that makes the block earns its share of the fee; the rest goes to the treasury
@@ -3104,6 +4062,7 @@ export async function applyTx(s: State, tx: Tx, time: number = s.time, proposer?
 		if (share) add(s, proposer!, NATIVE, share);
 		toTreasury(s, used - share);
 	}
+	if (s.heart && used && !bySun && tx.type === 'contract.call' && s.contracts && own(s.contracts, tx.data.contract)) { const by = s.contracts[tx.data.contract].creator; s.heart.dev[by] = (own(s.heart.dev, by) ? s.heart.dev[by] : 0) + used; }
 	if (used && !bySun && agent && tx.payer === undefined) { agent.fees! -= used; if (!agent.fees) delete agent.fees; }
 	if (report) { report.fee = used; if (ctx.gasUsed !== undefined) report.gasUsed = ctx.gasUsed; if (ctx.failed) report.failed = ctx.failed; }
 	if (agent && acct?.agents) {
@@ -3154,11 +4113,15 @@ export function holdings(s: State): Record<string, number> {
 	for (const sh of Object.values(s.shops ?? {})) for (const [a, n] of Object.entries(sh.reserve)) t[a] += n;
 	for (const q of Object.values(s.tasks ?? {})) t[q.asset] += q.reward * q.left;
 	for (const o of Object.values(s.xoffers ?? {})) t[o.give.asset] += o.give.amount;
+	t[NATIVE] += s.wdzy?.held ?? 0; // DZY on Solana: held here, as wDZY there
 	for (const [id, p] of Object.entries(s.liquidity ?? {})) { t[NATIVE] += p.dzy; t[id] += p.token; }
 	for (const [k, v] of Object.entries(s.vaults ?? {})) t[k.endsWith(':L') ? NATIVE : k.slice(0, -2)] += v.cash; // what is lent out was spent into a pool: counted there
 	for (const pos of Object.values(s.positions ?? {})) t[pos.side === 'L' ? pos.pool : NATIVE] += pos.held;
-	for (const l of Object.values(s.x?.loans ?? {})) t['x' + l.coin] += l.coll; // free coin held by Dznye dollar loans
+	for (const l of Object.values(loansOfX(s) ?? {})) t['x' + l.coin] += l.coll; // free coin held by Dznye dollar loans
 	for (const m of Object.values(s.markets ?? {})) t[NATIVE] += m.pool; // the DZY behind prediction-market shares
 	for (const r of Object.values(s.rounds ?? {})) t[NATIVE] += r.left; // the DZY in Up or Down rounds
+	t[NATIVE] += blobHeld(s as unknown as Parameters<typeof blobHeld>[0]); // what keeps files
+	evmHeld(s as unknown as Parameters<typeof evmHeld>[0], t); // coins among Ethereum contracts
+	zoneHeld(s, t); // coins in layers, their bonds and the deposits of questions
 	return t;
 }

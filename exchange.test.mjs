@@ -23,7 +23,7 @@ function key(i) {
 const K = Array.from({ length: 8 }, (_, i) => key(i));
 const VS = K.slice(0, 4), [A, B, C, SHOP] = K.slice(4);
 const CHAIN = 'dznye-exchange-test', T0 = 1_800_000_000_000;
-const BTC_TO = 'bc1qm4fx6l9egnt3hs437yg55udn38lct0rfmt0htk', ETH_TO = '0x62e26468dc54f87379728dcfae201f836a5763f0';
+const BTC_TO = 'bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4', ETH_TO = '0x00000000000000000000000000000000000d0e01';
 const fresh = async () => {
 	const s = await L.sunGenesis({ chain: CHAIN, time: T0, validators: VS.map((v) => v.address), seedWait: 0,
 		sales: [...[A, B, C, SHOP].map((k) => ({ to: k.address, units: dzy(1_000), paid: dzy(1_000) / 500, proof: 'test' })),
@@ -261,6 +261,99 @@ await test('The lift is only for a chain that names it: with no block set (and o
 	assert.equal(L.xUnlimited(m, 1), false, 'mainnet before its block');
 });
 
+await test('vault checkout (block-gated): a shop opens for $5 owed; an outside payment lands in the vault; the creator gets 99.5% as that coin on Dznye, the founder 0.5% and the $5 at once', async () => {
+	const s = await open();
+	await prices(s, { USDC: 1_000_000 });
+	const VAULT = '0x' + 'ab'.repeat(20);
+	for (const v of VS.slice(0, 3)) await send(s, v, 'x.vault', { net: 'base', address: VAULT });
+	await send(s, A, 'record.put', { space: 'items', key: 'pack', value: { title: 'Brush pack', kind: 'file', usd: 10_000_000, sealed: 'sealed-test' } });
+	L.testCheckoutV2From(CHAIN, s.height + 2);
+	try {
+		await send(s, C, 'x.price', {}).catch(() => {}); // a block passes: the upgrade is on from here
+		while (!L.checkoutV2(s)) { s.height += 1; }
+		await refused(s, B, 'order.open', { seller: A.address, item: 'pack', net: 'base', coin: 'USDC' }, /not opened their shop/);
+		await send(s, A, 'creator.join', {});
+		assert.equal(L.feeOwedOf(s, A.address), L.CREATOR_JOIN_USD, '$5 owed on joining');
+		await refused(s, A, 'creator.join', {}, /already open/);
+		await refused(s, B, 'order.open', { seller: A.address, item: 'pack', net: 'arb', coin: 'USDC' }, /network Dznye has a vault on/); // no vault listed there
+		await send(s, B, 'order.open', { seller: A.address, item: 'pack', net: 'base', coin: 'USDC' });
+		const [id, o] = Object.entries(s.orders).find(([, x]) => x.buyer === B.address);
+		assert.equal(o.payTo, VAULT, 'the buyer pays the vault, not the creator'); assert.equal(o.vault, true);
+		const tx = '0x' + 'cd'.repeat(32);
+		await send(s, B, 'order.paid', { id, tx });
+		const owner = L.RULES.saleFeeTo, a0 = bal(s, A, 'xUSDC'), f0 = L.balanceOf(s, owner, 'xUSDC');
+		for (const v of VS.slice(0, 3)) await send(s, v, 'order.attest', { id, tx, amount: o.due });
+		const fee = Math.floor(o.due * 50 / 10_000);
+		assert.equal(L.balanceOf(s, owner, 'xUSDC') - f0, fee + L.CREATOR_JOIN_USD, 'the founder gets the 0.5% and the $5, in USDC on Dznye');
+		assert.equal(bal(s, A, 'xUSDC') - a0, o.due - fee - L.CREATOR_JOIN_USD, 'the creator gets the rest');
+		assert.equal(L.feeOwedOf(s, A.address), 0, 'nothing owed');
+		assert.ok(s.owned[`${B.address}/${A.address}/pack`], 'the buyer owns it');
+		solvent(s, 'vault checkout'); whole(s, 'vault checkout');
+		return `paid ${o.due} into the vault: creator ${o.due - fee - L.CREATOR_JOIN_USD}, founder ${fee} + $5 join`;
+	} finally { L.testCheckoutV2From(CHAIN, null); }
+});
+
+await test('the fee setting: only the fee account sets it (0 to 20%), only from the upgrade; a set fee is what the next sale pays', async () => {
+	const s = await open();
+	await prices(s, { USDC: 1_000_000 });
+	await refused(s, A, 'fee.set', { bps: 100 }, /checkout upgrade/);
+	L.testCheckoutV2From(CHAIN, s.height + 1);
+	try {
+		await refused(s, A, 'fee.set', { bps: 100 }, /only the fee account/);
+		await refused(s, A, 'fee.clear', { who: B.address, usd: 1 }, /only the fee account/);
+		assert.equal(L.feeBpsOf(s), 50, 'the rule until set');
+		s.saleFeeBps = 1_000; // as fee.set by the fee account would leave it (10%)
+		assert.equal(L.feeBpsOf(s), 1_000);
+		const VAULT = '0x' + 'ef'.repeat(20);
+		for (const v of VS.slice(0, 3)) await send(s, v, 'x.vault', { net: 'base', address: VAULT });
+		await send(s, A, 'record.put', { space: 'items', key: 'print', value: { title: 'Print', kind: 'image', usd: 20_000_000, sealed: 'x' } });
+		await send(s, A, 'creator.join', {});
+		await send(s, B, 'order.open', { seller: A.address, item: 'print', net: 'base', coin: 'USDC' });
+		const [id, o] = Object.entries(s.orders).find(([, x]) => x.buyer === B.address), tx = '0x' + '12'.repeat(32);
+		await send(s, B, 'order.paid', { id, tx });
+		const f0 = L.balanceOf(s, L.RULES.saleFeeTo, 'xUSDC');
+		for (const v of VS.slice(0, 3)) await send(s, v, 'order.attest', { id, tx, amount: o.due });
+		assert.equal(L.balanceOf(s, L.RULES.saleFeeTo, 'xUSDC') - f0, Math.floor(o.due / 10) + L.CREATOR_JOIN_USD, '10% and the $5');
+		solvent(s, 'fee set'); whole(s, 'fee set');
+		assert.equal(L.exchangeView(s).fee.bps, 1_000, 'GET /exchange shows the fee now');
+		return `10% taken: ${Math.floor(o.due / 10)} of ${o.due}`;
+	} finally { L.testCheckoutV2From(CHAIN, null); }
+});
+
+await test('a wallet coin (ETH) pays a checkout in ONE vault deposit naming the order\'s tag; short of the price it stays the buyer\'s; naming it as a plain payment is refused', async () => {
+	const s = await open();
+	await prices(s, { USDC: 1_000_000, ETH: 3_000_000_000 });
+	const VAULT = '0x' + '77'.repeat(20);
+	for (const v of VS.slice(0, 3)) await send(s, v, 'x.vault', { net: 'base', address: VAULT });
+	await send(s, A, 'record.put', { space: 'items', key: 'song', value: { title: 'Song', kind: 'audio', usd: 30_000_000, sealed: 'x' } });
+	L.testCheckoutV2From(CHAIN, s.height + 1);
+	try {
+		await send(s, A, 'creator.join', {});
+		await send(s, B, 'order.open', { seller: A.address, item: 'song', net: 'base', coin: 'ETH' });
+		let [id, o] = Object.entries(s.orders).find(([, x]) => x.buyer === B.address);
+		assert.equal(o.payTo, VAULT); assert.match(o.tag, /^[0-9a-f]{64}$/, 'a tag for the deposit');
+		await refused(s, B, 'order.paid', { id, tx: '0x' + '34'.repeat(32) }, /nothing to name/);
+		// short: the buyer keeps it as free coin, the order stays open
+		await deposit(s, { net: 'base', coin: 'ETH', amount: Math.floor(o.due / 2), tx: payment(), to: o.tag });
+		assert.equal(bal(s, B, 'xETH'), Math.floor(o.due / 2), 'short: the buyer\'s own, as ETH on Dznye'); assert.ok(s.orders?.[id], 'still open');
+		const f0 = L.balanceOf(s, L.RULES.saleFeeTo, 'xETH');
+		await deposit(s, { net: 'base', coin: 'ETH', amount: o.due, tx: payment(), to: o.tag });
+		const fee = Math.floor(o.due * 50 / 10_000);
+		assert.ok(s.owned[`${B.address}/${A.address}/song`], 'the buyer owns it'); assert.equal(s.orders?.[id], undefined, 'closed');
+		assert.ok(L.balanceOf(s, L.RULES.saleFeeTo, 'xETH') - f0 >= fee, 'the founder gets the fee (and the $5) in ETH on Dznye');
+		assert.ok(bal(s, A, 'xETH') > 0, 'the creator gets ETH on Dznye');
+		solvent(s, 'eth checkout'); whole(s, 'eth checkout');
+		return `one deposit of ${o.due} (ETH units) closed the checkout`;
+	} finally { L.testCheckoutV2From(CHAIN, null); }
+});
+
+await test('before the upgrade the checkout pays the creator directly, and nobody needs to join', async () => {
+	const s = await open();
+	assert.equal(L.checkoutV2(s), false);
+	assert.equal(L.creatorJoined(s, A.address), true);
+	await refused(s, A, 'creator.join', {}, /checkout upgrade/);
+});
+
 await test('Attacks: draining a vault through a network that holds less, paying to a bad address, taking out locked coin as free, anyone but a validator posting prices', async () => {
 	const s = await open();
 	await prices(s, { ETH: 3_000_000_000 });
@@ -282,7 +375,7 @@ await test('600 random deposits, parks, price moves, closes, floor sales, take-o
 	let seed = 5; const rnd = (m) => { seed = (seed * 1103515245 + 12345) % 2 ** 31; return Math.floor((seed / 2 ** 31) * m); };
 	const P = { BTC: 90_000_000_000, ETH: 3_000_000_000, SOL: 150_000_000, USDC: 1_000_000 };
 	await prices(s, P);
-	const people = [A, B, C, SHOP], coins = Object.keys(L.X_COINS), to = (net) => net === 'btc' ? BTC_TO : net === 'sol' ? '7tSQ9qfiQPJusPXdL7FUmiMShzKFioZViDqgUERDHPas' : ETH_TO;
+	const people = [A, B, C, SHOP], coins = Object.keys(L.X_COINS), to = (net) => net === 'btc' ? BTC_TO : net === 'sol' ? '9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin' : ETH_TO;
 	let ok = 0, no = 0, floor = 0;
 	for (let i = 0; i < 600; i++) {
 		const k = people[rnd(4)], coin = coins[rnd(4)], net = L.X_COINS[coin].nets[rnd(L.X_COINS[coin].nets.length)], r = rnd(20);

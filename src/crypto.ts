@@ -3,7 +3,8 @@
 
 const enc = new TextEncoder();
 
-export const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+const HEX2 = Array.from({ length: 256 }, (_, x) => x.toString(16).padStart(2, '0'));
+export const hex = (b: Uint8Array) => { let s = ''; for (let i = 0; i < b.length; i++) s += HEX2[b[i]]; return s; };
 export function unhex(s: string): Uint8Array<ArrayBuffer> {
 	if (typeof s !== 'string' || !/^([0-9a-f]{2})*$/.test(s)) throw new Error('bad hex');
 	const out = new Uint8Array(new ArrayBuffer(s.length / 2));
@@ -29,7 +30,17 @@ export function canon(v: unknown): string {
 	throw new Error('this value cannot be encoded');
 }
 
+/** A host with a quicker SHA-256 (Node's own) may lend it (node/server.mjs). It is tried on several texts first and
+    taken only if every answer is exactly Web Crypto's: it can change how fast a hash comes, never the hash. */
+let quick: ((s: string) => string) | null = null;
+export async function lendSha256(fn: (s: string) => string): Promise<boolean> {
+	quick = null;
+	for (const t of ['', 'a', 'dzy-tx:{"a":1}', '\u00e9\u4e2d\ud83d\ude80', '\ud800 alone', 'x'.repeat(55), 'x'.repeat(56), 'x'.repeat(64), 'y'.repeat(10_000)]) if (fn(t) !== (await sha256(t))) return false;
+	quick = fn;
+	return true;
+}
 export async function sha256(s: string): Promise<string> {
+	if (quick) return quick(s);
 	return hex(new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(s))));
 }
 
@@ -100,11 +111,26 @@ export function fromSolana(text: string): string | null {
 /** a Dznye address: 64 lower-case hex digits */
 export const isAddrHex = (v: unknown): v is string => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v);
 
+/* A node checks the same signature several times (at the door, in its own block, in a proposal, in the decided block).
+   GOOD remembers exact (address, message, signature) triples that were found good, newest last; a bad one is never
+   remembered. KEYS keeps the keys already read. Both are bounded and change nothing but speed. */
+const GOOD = new Set<string>(), KEYS = new Map<string, CryptoKey>(), MAX_GOOD = 12_000, MAX_KEYS = 4_000, MAX_REMEMBERED = 3_000;
+async function keyOf(address: string): Promise<CryptoKey> {
+	let k = KEYS.get(address);
+	if (k) return k;
+	k = await crypto.subtle.importKey('raw', unhex(address), ED, false, ['verify']);
+	if (KEYS.size >= MAX_KEYS) KEYS.delete(KEYS.keys().next().value as string);
+	KEYS.set(address, k);
+	return k;
+}
 /** true only when `sig` is this address's signature of exactly this message; never throws */
 export async function verify(address: string, message: string, sig: string): Promise<boolean> {
 	try {
-		const key = await crypto.subtle.importKey('raw', unhex(address), ED, false, ['verify']);
-		return await crypto.subtle.verify(ED, key, unhex(sig), enc.encode(message));
+		const id = message.length <= MAX_REMEMBERED ? address + sig + message : ''; // an address and a signature have fixed lengths (checked by unhex and verify), so no two triples spell the same
+		if (id && address.length === 64 && sig.length === 128 && GOOD.has(id)) return true;
+		const ok = await crypto.subtle.verify(ED, await keyOf(address), unhex(sig), enc.encode(message));
+		if (ok && id && address.length === 64 && sig.length === 128) { if (GOOD.size >= MAX_GOOD) GOOD.delete(GOOD.values().next().value as string); GOOD.add(id); }
+		return ok;
 	} catch {
 		return false;
 	}

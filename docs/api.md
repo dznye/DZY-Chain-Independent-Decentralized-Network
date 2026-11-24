@@ -15,12 +15,18 @@ Every node answers JSON over HTTP. Amounts are integers in an asset's smallest u
 | `GET /supply`, `GET /supply/<asset>`, `GET /economy` | amounts in existence and their pools |
 | `POST /tx` | submit a signed transaction: `{ "tx": { ... } }` (see transactions.md) |
 | `POST /simulate` | run a transaction without keeping its result |
+| `POST /explain` | `{ from, type, data }`: what an action does, in plain words, and its price in dollars; nothing is signed |
+| `GET /fees` | the fee now (shards and dollars), how many wait, how many fit a block; `slow.max`, `normal`, `fast.tip` |
+| `GET /heart` | the Heart rules: each validator's stake, time online, raffle shards, proven, chance; `nextPlace`; block size; the moving price |
+| `GET /heart` → `grants`, `coin.g`, `props` | the contributors' fund (DZY in shards, coins by name) and its open proposals: `{ by, to, asset, amount, reason, until, votes }` |
+| `GET /look/<id>`, `GET /nft/<id>.json` | a file's small picture; an NFT as ERC-721 metadata |
+| `POST /evm` | Ethereum JSON-RPC for Solidity on the chain (chain id 4479577) |
 
 ## Accounts and names
 
 | Request | Answer |
 |---|---|
-| `GET /account/<address>` | balances, nonce, name, links |
+| `GET /account/<address>` | balances, nonce, name, links, keys, stake; `hashKey` (`{ root, n, only? }` or null: its hash key, how many times used) |
 | `GET /name/<name>` | the address holding a name, and its linked addresses |
 | `GET /names/premium` | the current price of 1, 2 and 3 character names |
 

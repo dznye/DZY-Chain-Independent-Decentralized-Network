@@ -34,7 +34,17 @@ function rest(s: Obj): Obj {
 		if (sun.credit) { const { out: _o, bad: _b, ...c } = sun.credit as Obj; sunRest.credit = c; }
 	}
 	return { pools: s.pools, started: s.started, validators: s.validators, fee: s.fee || undefined, staked: s.staked || undefined,
-		treasury: s.treasury || undefined, trades: s.trades, swapLog: s.swapLog, sun: sunRest, crew: s.crew };
+		treasury: s.treasury || undefined, trades: s.trades, swapLog: s.swapLog, sun: sunRest, crew: s.crew, ...(s.heart ? { all: everything(s) } : {}) };
+}
+/** From the Heart upgrade on, the fingerprint covers the WHOLE state: every other field too (the exchange's vaults, locks
+    and pots, the creators' fee, the recent hashes...), so two nodes that differ anywhere can never agree on a block, and a
+    copy handed to a new node cannot be altered anywhere. Left out: the collections (leaves of their own), what is listed
+    above, and the block's own height, time and hash, which are set after. */
+const COVERED = new Set(['pools', 'started', 'validators', 'fee', 'staked', 'treasury', 'trades', 'swapLog', 'sun', 'crew', 'height', 'time', 'last', ...COLLECTIONS.filter(([, p]) => p.length === 1).map(([, p]) => p[0])]);
+function everything(s: Obj): Obj {
+	const out: Obj = {};
+	for (const k of Object.keys(s)) if (!COVERED.has(k) && s[k] !== undefined) out[k] = s[k];
+	return out;
 }
 
 interface Leaf { hash: string; bucket: string }
@@ -56,10 +66,11 @@ const ALL = new Set<WeakRef<RootCache>>();
 const EMPTY = sha256('dzy-empty');
 let checking = false; // the check itself computes a fingerprint: it must not check that one too
 const HEX64 = /^[0-9a-f]{64}$/; // a key that is already a hash (an address): its own first 6 digits are its bucket
+const TWO = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0'));
 /** a node's hash from its non-empty children (each as its last 2 hex digits + its hash), or null when it has none */
 async function nodeHash(c: RootCache, prefix: string): Promise<string | null> {
 	const parts: string[] = [];
-	for (let i = 0; i < 256; i++) { const k = prefix + i.toString(16).padStart(2, '0'), h = c.node.get(k); if (h) parts.push(k.slice(-2) + h); }
+	for (let i = 0; i < 256; i++) { const h = c.node.get(prefix + TWO[i]); if (h) parts.push(TWO[i] + h); }
 	return parts.length ? sha256('node:' + parts.join('')) : null;
 }
 

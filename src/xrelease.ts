@@ -9,7 +9,7 @@ import { sha256 } from './crypto.ts';
 import { evmAddressOf, signDigest } from './evmsign.ts';
 import { keccak256, SECP_N } from './secp.ts';
 import { EVM } from './evm.ts';
-import { exchangeVaults, type State } from './ledger.ts';
+import { exchangeVaults, wdzyMint, type State } from './ledger.ts';
 import { evmTokenOf } from './xtokens.ts';
 
 const enc = new TextEncoder();
@@ -80,8 +80,10 @@ export function solReleaseFor(s: State, payoutId: string, setId: number, usdcMin
 	const program = exchangeVaults(s).sol;
 	if (!program || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(program)) return { error: 'no vault is listed on sol' } as const;
 	if (!Number.isSafeInteger(setId) || setId < 1) return { error: 'name the vault\'s current set: setId' } as const;
-	if (p.coin !== 'SOL' && p.coin !== 'USDC') return { error: `${p.coin} is not paid from the Solana vault` } as const;
-	return { program, setId, id32: payoutId32(s.chain, payoutId), mint: p.coin === 'SOL' ? null : usdcMint, to: p.to, amount: BigInt(p.amount) }; // SOL in lamports, USDC in millionths: as the chain counts them
+	const wdzy = p.coin === 'wDZY' ? wdzyMint(s.chain) : null;
+	if (p.coin === 'wDZY' && !wdzy) return { error: 'DZY on Solana has no token on this chain' } as const;
+	if (p.coin !== 'SOL' && p.coin !== 'USDC' && p.coin !== 'wDZY') return { error: `${p.coin} is not paid from the Solana vault` } as const;
+	return { program, setId, id32: payoutId32(s.chain, payoutId), mint: p.coin === 'SOL' ? null : p.coin === 'wDZY' ? wdzy : usdcMint, to: p.to, amount: BigInt(p.amount) }; // SOL in lamports, USDC in millionths: as the chain counts them
 }
 /** this validator's Ed25519 signature on a Solana release, with its key (32 bytes, hex: also its Dznye address) */
 export async function signSolRelease(dznyeSecret: string, r: Parameters<typeof solReleaseMessage>[0]) {

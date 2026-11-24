@@ -74,7 +74,10 @@ export class Engine {
 	private rounds = new Map<number, RoundState>();
 	private validIds = new Set<string>(); // blocks we have checked ourselves and found valid
 
-	constructor(me: string, validators: string[], height: number, out: Out, memory?: Memory, power?: Record<string, number>) {
+	private turn: ((round: number) => string) | undefined;
+	/** `turn`: whose turn each round is (left out: validators take turns in their agreed order) */
+	constructor(me: string, validators: string[], height: number, out: Out, memory?: Memory, power?: Record<string, number>, turn?: (round: number) => string) {
+		this.turn = turn;
 		this.me = me; this.validators = validators; this.height = height; this.out = out;
 		this.weight = (v) => (power && Object.hasOwn(power, v) ? power[v] : 1);
 		const total = validators.reduce((n, v) => n + this.weight(v), 0);
@@ -90,7 +93,7 @@ export class Engine {
 	private weigh(who: Iterable<string>) { let n = 0; for (const v of who) n += this.weight(v); return n; }
 
 	/** whose turn it is to propose in a round: validators take turns, in their agreed order */
-	proposer(round: number) { return this.validators[(this.height + round) % this.validators.length]; }
+	proposer(round: number) { return this.turn ? this.turn(round) : this.validators[(this.height + round) % this.validators.length]; }
 	get memory(): Memory { return { lockedId: this.lockedId, lockedRound: this.lockedRound, validId: this.validId, validRound: this.validRound }; }
 	get started() { return this.round >= 0; }
 

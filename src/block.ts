@@ -1,6 +1,9 @@
 import { canon, merkleRoot, sha256, sign, verify } from './crypto.ts';
 import { commit, fork, plain, seal, unseal } from './layer.ts';
-import { applyTx, endBlock, powers, RULES, stateRoot, sunBlock, txMessage, voteMessage, type State, type Tx } from './ledger.ts';
+import { decodeTogether, EVM_RULES, keepReceipts } from './evmledger.ts';
+import { BLOB } from './blobs.ts';
+import { HEART, maxTx, roomOf, turnFor } from './heart.ts';
+import { applyTx, endBlock, gasLimitOf, powers, RULES, stateRoot, sunBlock, txMessage, voteMessage, type State, type Tx } from './ledger.ts';
 export { voteMessage };
 
 /* Blocks: a batch of transactions, chained to the block before it by hash.
@@ -52,23 +55,43 @@ export const signVote = (chain: string, type: VoteType, height: number, round: n
 const txRootOf = (txs: Tx[]) => merkleRoot(txs.map((t) => txMessage(t) + ':' + t.sig + (t.payerSig === undefined ? '' : ':' + t.payerSig) + (t.cosigs === undefined ? '' : ':' + canon(t.cosigs))));
 
 /** whose turn it is to put block `height` together in `round`: validators take turns in their agreed order */
-export const proposerFor = (state: State, height: number, round: number) => state.validators[(height + round) % state.validators.length];
+export const proposerFor = (state: State, height: number, round: number) => turns(state, height)(round);
+/** whose turn each round of a height is, as the state stands now (the Heart upgrade draws it: heart.ts) */
+export function turns(state: State, height: number): (round: number) => string {
+	const vs = state.validators;
+	if (!state.heart) return (round) => vs[(height + round) % vs.length];
+	const power = { ...powers(state) }, seed = state.crew?.seed ?? '', list = vs.slice();
+	return (round) => turnFor(list, power, seed, height, round);
+}
 
 /** Put the next block together, in agreement round `round`. Every transaction must be valid, in order. The given state is not changed. */
-export async function makeBlock(state: State, txs: Tx[], time: number, proposer: string, round = 0): Promise<{ block: Proposed; state: State }> {
-	if (txs.length > RULES.maxTxPerBlock) throw new Error('too many transactions for one block');
+export async function makeBlock(state: State, txs: Tx[], time: number, proposer: string, round = 0, skip = false): Promise<{ block: Proposed; state: State }> {
+	if (txs.length > maxTx(state)) throw new Error('too many transactions for one block');
+	if (state.heart && (fits(txs, txs.length, roomOf(state)) < txs.length || !cargoFits(txs, roomOf(state).bytes))) throw new Error('too big for one block');
 	if (!Number.isSafeInteger(time) || time < state.time) throw new Error('block time cannot go backwards');
 	if (!Number.isSafeInteger(round) || round < 0) throw new Error('bad round');
 	if (!state.validators.includes(proposer)) throw new Error('this key is not a validator');
 	if (proposerFor(state, state.height + 1, round) !== proposer) throw new Error("it is not this key's turn to make a block");
 	const s = fork(state); // a layer: the given state is never changed, and nothing is copied that the block does not touch
 	if (!s.started) s.started = time; // block 1 starts the clock for the pools
-	for (const tx of txs) await applyTx(s, tx, time, proposer);
+	if (state.heart && sidesMissing(txs)) { if (!skip) throw new Error('a file\'s bytes are missing'); txs = txs.filter((t) => t.type !== 'blob.part' || t.side !== undefined); }
+	await together(txs);
+	if (skip) { const ok: Tx[] = []; for (const tx of txs) { try { await applyTx(s, tx, time, proposer); ok.push(tx); } catch { /* it waits for a block that fits it */ } } txs = ok; } // a refused one leaves no trace
+	else for (const tx of txs) await applyTx(s, tx, time, proposer);
 	endBlock(s, state.height + 1, round, proposer, time);
-	await sunBlock(s, time, txs.length, proposer); // a chain with the Sun: the fee formula, the proposer's turn, and a chain minute when the clock reaches one
+	await sunBlock(s, time, txs.length, proposer, bytesOf(txs)); // a chain with the Sun: the fee formula, the proposer's turn, and a chain minute when the clock reaches one
 	const block: Proposed = { height: state.height + 1, prev: state.last, time, proposer, ...(round ? { round } : {}), txs, txRoot: await txRootOf(txs), stateRoot: await stateRoot(s) };
 	s.height = block.height; s.time = time; s.last = await blockHash(state.chain, block);
+	keepReceipts(block, s);
 	return { block, state: s };
+}
+
+/** Check these transactions' main signatures side by side (on every core the machine has), so that applying them one by one
+    afterwards finds each already checked. It decides nothing: applyTx still asks for every one. */
+export async function together(txs: readonly Tx[]): Promise<void> {
+	const evm = txs.filter((tx) => tx?.type === 'evm.run').map((tx) => tx.data?.raw);
+	if (evm.length) await decodeTogether(evm);
+	await Promise.all(txs.map(async (tx) => { try { if (tx && typeof tx === 'object' && typeof tx.sig === 'string') await verify((tx.signer ?? tx.from) as string, txMessage(tx), tx.sig); } catch { /* applyTx says why */ } }));
 }
 
 /** Check everything about a block except who signed it. Returns the state after it, or throws with the reason.
@@ -85,15 +108,19 @@ export async function checkBlock(state: State, block: Proposed, now?: number): P
 	if (proposerFor(state, block.height, round) !== block.proposer) throw new Error("it was not that validator's turn to make this block");
 	if (!Number.isSafeInteger(block.time) || block.time < state.time) throw new Error('block time went backwards');
 	if (now !== undefined && block.time > now + RULES.clockSlack) throw new Error('the block is dated in the future');
-	if (block.txs.length > RULES.maxTxPerBlock) throw new Error('too many transactions');
+	if (block.txs.length > maxTx(state)) throw new Error('too many transactions');
+	if (state.heart && (fits(block.txs, block.txs.length, roomOf(state)) < block.txs.length || !cargoFits(block.txs, roomOf(state).bytes))) throw new Error('the block is too big');
+	if (state.heart && now !== undefined && block.time > now - BLOB.freshMs && sidesMissing(block.txs)) throw new Error('a file\'s bytes are missing');
 	const s = fork(state);
+	await together(block.txs);
 	if (!s.started) s.started = block.time;
 	for (const tx of block.txs) await applyTx(s, tx, block.time, block.proposer);
 	endBlock(s, block.height, round, block.proposer, block.time);
-	await sunBlock(s, block.time, block.txs.length, block.proposer);
+	await sunBlock(s, block.time, block.txs.length, block.proposer, bytesOf(block.txs));
 	if ((await txRootOf(block.txs)) !== block.txRoot) throw new Error('transactions do not match the block');
 	if ((await stateRoot(s)) !== block.stateRoot) throw new Error('state does not match the block');
 	s.height = block.height; s.time = block.time; s.last = await blockHash(state.chain, block);
+	keepReceipts(block, s);
 	return s;
 }
 
@@ -124,12 +151,79 @@ export async function verifyBlock(state: State, block: Block, now?: number): Pro
 
 /** Make a block and sign it with one validator. Final by itself only on a chain with a single validator;
     with more, the other signatures come from the agreement between validators (consensus.ts). */
-export async function produceBlock(state: State, txs: Tx[], time: number, by: Signer): Promise<{ block: Block; state: State }> {
-	const made = await makeBlock(state, txs, time, by.address);
-	const sig = await signVote(state.chain, 'precommit', made.block.height, 0, made.state.last, by);
-	if (!(await verify(by.address, voteMessage(state.chain, 'precommit', made.block.height, 0, made.state.last), sig))) throw new Error('that secret does not belong to that validator');
-	return { block: { ...made.block, commit: { round: 0, sigs: [{ validator: by.address, sig }] } }, state: made.state };
+export async function produceBlock(state: State, txs: Tx[], time: number, by: Signer, round = 0, skip = false): Promise<{ block: Block; state: State }> {
+	const made = await makeBlock(state, txs, time, by.address, round, skip);
+	const sig = await signVote(state.chain, 'precommit', made.block.height, round, made.state.last, by);
+	if (!(await verify(by.address, voteMessage(state.chain, 'precommit', made.block.height, round, made.state.last), sig))) throw new Error('that secret does not belong to that validator');
+	const block: Block = { ...made.block, commit: { round, sigs: [{ validator: by.address, sig }] } };
+	keepReceipts(block, made.state);
+	return { block, state: made.state };
 }
+/** the first round in which it is this validator's turn to make block `height` (-1: none within a few thousand) */
+export function roundOf(state: State, height: number, who: string): number {
+	if (!state.validators.includes(who)) return -1;
+	const turn = turns(state, height);
+	for (let r = 0; r < 4096; r++) if (turn(r) === who) return r;
+	return -1;
+}
+
+/* A block travels whole between nodes, and is stored whole. So a validator fills it by size as well as by count: never
+   past MAX_BLOCK_BYTES, which every node accepts (2,000,000) and every host can store, with room for the signatures. */
+export const MAX_BLOCK_BYTES = HEART.sizeStart;
+const SIZES = new WeakMap<object, number>(), utf8 = new TextEncoder();
+export function txBytes(tx: Tx): number {
+	let n = SIZES.get(tx);
+	if (n === undefined) { const { side: _side, ...rest } = tx; SIZES.set(tx, (n = utf8.encode(JSON.stringify(rest)).length + 1 + (tx.type === 'blob.part' && Number.isSafeInteger(tx.data?.len) && (tx.data.len as number) > 0 ? Math.min(tx.data.len as number, RULES.maxPartChars) : 0))); } // a part weighs what its bytes do, whether or not they are here
+	return n;
+}
+/** how many of these transactions, from the first, fit in one block: by count, size, and the gas their contract calls may use */
+export function fits(txs: readonly Tx[], most: number, room: { bytes: number; gas: number; evm?: number } = { bytes: MAX_BLOCK_BYTES, gas: Infinity }): number {
+	let n = 0, size = 0, gas = 0, evm = 0;
+	for (const tx of txs) {
+		if (n >= most) break;
+		size += txBytes(tx);
+		if (tx.type === 'contract.call' || tx.type === 'contract.deploy') { try { gas += gasLimitOf(tx.data); } catch { /* refused when applied */ } }
+		if (tx.type === 'evm.run') evm += Number.isSafeInteger(tx.data?.gas) && (tx.data.gas as number) > 0 ? (tx.data.gas as number) : 0;
+		if (size > room.bytes || gas > room.gas || (room.gas !== Infinity && evm > (room.evm ?? EVM_RULES.blockGas))) break;
+		n++;
+	}
+	return n;
+}
+/** files travel in the cargo lane: never more than half of a block */
+/** must these transactions' file bytes be here? Those of a block made lately (an old one may come without them) */
+export const sidesMissing = (txs: readonly Tx[]) => txs.some((tx) => tx.type === 'blob.part' && tx.side === undefined);
+/** a block without its files' bytes: it checks the same (nothing signed or fingerprinted is gone) */
+export const bare = <T extends { txs: Tx[] }>(block: T): T => (block.txs.some((t) => t.side !== undefined) ? { ...block, txs: block.txs.map((t) => { if (t.side === undefined) return t; const { side: _s, ...rest } = t; return rest as Tx; }) } : block);
+export const isCargo = (tx: Tx) => tx.type === 'blob.part';
+export const cargoFits = (txs: readonly Tx[], bytes: number) => txs.reduce((n, tx) => n + (isCargo(tx) ? txBytes(tx) : 0), 0) * 2 <= bytes;
+/** What a block takes from the waiting room: everyone else first, in the order they came, then files with what is left, at
+    most half of the block. (An action left out for now simply waits; one that depended on it is skipped when the block is
+    put together, and waits too.) */
+/** the first that fit, and whatever later ones still fit in the room that is left (one too big for now waits, with all its
+    account's later ones; it does not keep the others out) */
+function pack(txs: readonly Tx[], most: number, room: { bytes: number; gas: number; evm?: number }): Tx[] {
+	const n = fits(txs, most, room); if (n === txs.length) return txs.slice();
+	const out = txs.slice(0, n), late = new Set<string>(), full = { bytes: room.bytes - bytesOf(out), gas: room.gas, evm: room.evm }; let looked = 0;
+	for (const tx of txs.slice(n)) {
+		if (out.length >= most || full.bytes < 200 || ++looked > 2_000) break;
+		if (late.has(tx.from) || txBytes(tx) > full.bytes || tx.type === 'contract.call' || tx.type === 'contract.deploy' || tx.type === 'evm.run') { late.add(tx.from); continue; } // (computing is bounded by `fits`, at the front)
+		out.push(tx); full.bytes -= txBytes(tx);
+	}
+	return out;
+}
+/** When not everything fits: who tips more for the room it takes goes first; the rest as they came. One account's own stay in order. */
+function byTip(txs: readonly Tx[], room: { bytes: number; evm?: number }): Tx[] {
+	const least = new Map<string, number>();
+	return txs.map((tx, i): [Tx, number, number] => { const work = tx.type === 'evm.run' && room.evm ? (Number(tx.data?.gas) || 0) * (room.bytes / room.evm) : 0, own = (tx.tip ?? 0) / (txBytes(tx) + work), r = Math.min(own, least.get(tx.from) ?? Infinity); least.set(tx.from, r); return [tx, r, i]; }).sort((a, b) => b[1] - a[1] || a[2] - b[2]).map(([tx]) => tx);
+}
+export function choose(txs: readonly Tx[], most: number, room: { bytes: number; gas: number; evm?: number }): Tx[] {
+	const line = txs.filter((tx) => !isCargo(tx)), cargo = txs.filter(isCargo), first = fits(line, most, room) < line.length && line.some((tx) => tx.tip) ? byTip(line, room) : line;
+	const out = pack(first, most, cargo.length ? { ...room, bytes: Math.max(room.bytes - Math.min(cargo.reduce((n, tx) => n + txBytes(tx), 0), Math.floor(room.bytes / 8)), 0) } : room); // files always get an eighth: a flood of payments never shuts them out
+	let size = bytesOf(out), c = 0;
+	for (const tx of cargo) { const n = txBytes(tx); if (out.length >= most || size + n > room.bytes || (c + n) * 2 > room.bytes) break; out.push(tx); size += n; c += n; }
+	return out;
+}
+export const bytesOf = (txs: readonly Tx[]) => txs.reduce((n, tx) => n + txBytes(tx), 0);
 
 /** Replay a whole chain from its genesis. Throws at the first block that breaks a rule. */
 export async function replay(genesis: State, blocks: Block[]): Promise<State> {

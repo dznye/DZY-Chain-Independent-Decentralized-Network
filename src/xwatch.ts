@@ -76,6 +76,8 @@ export async function readChainPrices(eth: Rpc | null, sol: Rpc | null): Promise
 	out.USDT = 1_000_000; // the USDC/USDT pool above already showed both dollar coins are a dollar
 	// BNB, POL and AVAX have no deep pool on Ethereum: Chainlink's feeds there, read on the chain, and only while fresh
 	for (const [c, feed] of Object.entries(PRICE_FEEDS)) { const p = await feedPrice(eth, feed).catch(() => 0); if (p > 0) out[c] = Math.round(p * 1e6); }
+	// gold: an ounce of PAXG or XAUT at Chainlink's XAU / USD (the node posts it only once gold counts: xLive)
+	{ const g = await feedPrice(eth, GOLD_FEED).catch(() => 0); if (g > 0) { out.PAXG = Math.round(g * 1e6); out.XAUT = Math.round(g * 1e6); } }
 	return out;
 }
 /** Chainlink's price feeds on Ethereum (8 decimals; descriptions checked on the chain 2026-11-19: "BNB / USD", "MATIC / USD"
@@ -85,6 +87,8 @@ export const PRICE_FEEDS: Readonly<Record<string, string>> = Object.freeze({ BNB
    heartbeat; gaps of up to 22 hours seen on the chain 2026-11-19). So an answer under 25 hours old is within about 1% of the
    price; an older one means the feed is stuck, and is no price. (3 hours, the first rule, refused them most of the day.) */
 export const FEED_MAX_AGE_S = 25 * 3600;
+/** Chainlink's gold feed on Ethereum (description checked on the chain 2026-11-24: "XAU / USD", 8 decimals) */
+export const GOLD_FEED = '0x214eD9Da11D2fbe465a6fc601a91E62EbEc1a0D6';
 /** a feed's latest answer in dollars, or 0 when it is not positive or older than FEED_MAX_AGE_S (a stuck feed is no price) */
 export async function feedPrice(rpc: Rpc, feed: string, now: number = Date.now()): Promise<number> {
 	const r: string = await rpc('eth_call', [{ to: feed, data: '0xfeaf968c' }, 'latest']); // latestRoundData()
@@ -116,6 +120,12 @@ export async function scanEvmVault(rpc: Rpc, vault: string, net: string, from: n
     answers, unlike eth_getLogs over a range): null while it is not yet final (or not found yet); otherwise what it
     deposited, possibly nothing (a failed payment, or one to another address). Anyone may name the transaction: only the
     chain's own receipt counts, so a wrong or made-up one gives nothing. */
+/** Is this very payment there, final, into this vault? true: yes. false: the chain answers, and it is not (no such
+    transaction, or it does not pay that). Throws when the node cannot be asked. */
+export async function paymentThere(rpc: Rpc, vault: string, want: { net: string; coin: string; amount: number; to: string }, id: string, depth?: number): Promise<boolean> {
+	const fin = await finalBlock(rpc, depth ?? 64, depth === undefined), found = await depositsInTx(rpc, vault, want.net, id.split('l')[0], fin);
+	return !!found && found.deposits.some((d) => d.tx === id && d.coin === want.coin && d.amount === want.amount && d.to === want.to);
+}
 export async function depositsInTx(rpc: Rpc, vault: string, net: string, tx: string, finalBlockNo: number): Promise<{ deposits: FoundDeposit[]; released: { id32: string; tx: string }[] } | null> {
 	if (!/^0x[0-9a-fA-F]{64}$/.test(tx)) return { deposits: [], released: [] };
 	const r: any = await rpc('eth_getTransactionReceipt', [tx]);
@@ -162,7 +172,7 @@ export function programLines(logs: string[], program: string): string[] {
 }
 /** Deposits and releases in the vault program's finalized transactions after `until` (a transaction signature): oldest
     first, at most `limit`. SOL in lamports, USDC in millionths (the chain's units). `next`: the newest signature read. */
-export async function scanSolVault(rpc: Rpc, program: string, usdcMint: string, until: string | undefined, limit = 50, pages = 10) {
+export async function scanSolVault(rpc: Rpc, program: string, usdcMint: string, until: string | undefined, limit = 50, pages = 10, wdzyMint: string | null = null) {
 	// newest first, page by page back to `until`, so nothing between two looks is skipped however many there were
 	const sigs: { signature: string; err: unknown }[] = [];
 	let before: string | undefined;
@@ -181,7 +191,7 @@ export async function scanSolVault(rpc: Rpc, program: string, usdcMint: string, 
 		for (const line of programLines(t.meta?.logMessages ?? [], program)) {
 			const d = line.match(/^dznye-deposit (\S+) ([0-9a-f]{64}) (\d+)$/), r = line.match(/^dznye-released ([0-9a-f]{64}) \d+$/);
 			if (d) {
-				const coin = d[1] === 'SOL' ? 'SOL' : d[1] === usdcMint ? 'USDC' : null, amount = Number(d[3]);
+				const coin = d[1] === 'SOL' ? 'SOL' : d[1] === usdcMint ? 'USDC' : wdzyMint && d[1] === wdzyMint ? 'wDZY' : null, amount = Number(d[3]);
 				if (coin && Number.isSafeInteger(amount) && amount > 0 && !/^0+$/.test(d[2])) deposits.push({ tx: k++ ? `${s.signature}n${k}` : s.signature, coin, amount, to: d[2] }); // several in one transaction: each its own id
 			} else if (r) released.push({ id32: '0x' + r[1], tx: s.signature });
 		}

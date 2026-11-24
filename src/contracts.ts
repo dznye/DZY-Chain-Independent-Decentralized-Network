@@ -17,6 +17,8 @@
    and events (["emit", value]) that apps can follow. A call that fails while running still pays for the gas it used,
    and the failure is recorded as an event; a call that is malformed is refused outright. */
 
+import { sha256 as sha256Sync } from './btc.ts';
+
 export type Value = number | string | boolean | null;
 export type Expr = Value | Expr[];
 export interface Program { functions: Record<string, { args?: string[]; body: Expr; view?: boolean }>; init?: Expr }
@@ -29,10 +31,13 @@ export const LIMITS = {
 	events: 50, // the newest events each contract keeps
 	keyChars: 96, valueChars: 256, // a storage key, a stored string
 	entries: 10_000, // stored values per contract
+	heartEntries: 1_000_000, // ... from the Heart upgrade on
 	argChars: 512 // all of a call's arguments
 };
 /** what each kind of step costs */
-export const GAS = { step: 1, read: 20, write: 100, transfer: 200, perChar: 1, call: 500, emit: 50, token: 2000 };
+export const GAS = { step: 1, read: 20, write: 100, transfer: 200, perChar: 1, call: 500, emit: 50, token: 2000, hash: 60, big: 20, layer: 100 };
+/** operations that exist from the Heart upgrade on */
+const NEW_OPS = new Set(['muldiv', 'sha256', 'layerroot', 'slice']);
 
 /** a call that failed while running (not a malformed one): it still pays for the gas it used */
 export class ContractFailure extends Error {
@@ -45,7 +50,9 @@ const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isSaf
 const isName = (v: unknown): v is string => typeof v === 'string' && /^[a-z_][a-z0-9_]{0,31}$/i.test(v);
 
 /** Check a program's shape before it is stored, so a broken one is refused at once, not when first called. */
-export function checkProgram(p: unknown): Program {
+let newer = false; // checkProgram and shape run without a pause in between
+export function checkProgram(p: unknown, heart = false): Program {
+	newer = heart;
 	if (!p || typeof p !== 'object' || Array.isArray(p)) fail('a program is { functions: { name: { args, body } } }');
 	const prog = p as Program;
 	if (!prog.functions || typeof prog.functions !== 'object' || Array.isArray(prog.functions)) fail('a program needs functions');
@@ -68,7 +75,7 @@ function shape(e: unknown, depth: number) {
 	if (typeof e === 'number') { if (!isInt(e)) fail('only whole numbers are allowed'); return; }
 	if (!Array.isArray(e) || !e.length || typeof e[0] !== 'string') fail('an expression is a value or ["operation", ...]');
 	const arr = e as unknown[];
-	if (!Object.hasOwn(OPS, arr[0] as string)) fail(`unknown operation: ${arr[0]}`);
+	if (!Object.hasOwn(OPS, arr[0] as string) || (NEW_OPS.has(arr[0] as string) && !newer)) fail(`unknown operation: ${arr[0]}`);
 	for (let i = 1; i < arr.length; i++) {
 		// ["call", address, fn, [arg, arg, ...], ...]: the arguments are a plain list of expressions
 		if (arr[0] === 'call' && i === 3 && Array.isArray(arr[3])) { if (arr[3].length > 16) fail('a call takes at most 16 arguments'); for (const x of arr[3]) shape(x, depth + 1); continue; }
@@ -86,7 +93,9 @@ export interface World {
 	get(key: string): Value | undefined;
 	set(key: string, v: Value): void;
 	del(key: string): void;
-	entries(): number;
+	entries(): number; maxEntries?: number;
+	/** the newest state of a layer that counts (zones.ts), or null */
+	layerRoot?(id: string): string | null;
 	balance(who: string, asset: string): number;
 	transfer(asset: string, to: string, amount: number): void;
 	/** call another contract; returns its value and the gas it used (taken from this call's gas) */
@@ -131,6 +140,14 @@ const OPS: Record<string, Op> = {
 	'+': n2('+', (x, y) => x + y), '-': n2('-', (x, y) => x - y), '*': n2('*', (x, y) => x * y),
 	'/': n2('/', (x, y) => (y === 0 ? fail('division by zero') : Math.trunc(x / y))),
 	'%': n2('%', (x, y) => (y === 0 ? fail('division by zero') : x % y)),
+	// a x b / c exactly, however big a x b is on the way (what prices and shares need), rounded down; ["muldiv", a, b, c]
+	muldiv: (f, a) => { if (a.length !== 3) fail('muldiv takes three'); use(f, GAS.big); const x = num(f, a[0]), y = num(f, a[1]), z = num(f, a[2]); if (z === 0) fail('division by zero'); return safe(Number((BigInt(x) * BigInt(y)) / BigInt(z))); },
+	// the SHA-256 of a text, as 64 hex digits (secrets, proofs, commitments)
+	sha256: (f, a) => { const s = str(f, a[0]); use(f, GAS.hash + s.length * GAS.perChar); const b = sha256Sync(new TextEncoder().encode(s)); let h = ''; for (const x of b) h += x.toString(16).padStart(2, '0'); return h; },
+	// part of a text: ["slice", text, from, to]
+	slice: (f, a) => { const s = str(f, a[0]); use(f, s.length * GAS.perChar); return s.slice(num(f, a[1]), num(f, a[2])); },
+	// the newest state fingerprint of a layer that counts, or null
+	layerroot: (f, a) => { use(f, GAS.layer); return f.world.layerRoot?.(str(f, a[0], 'a layer')) ?? null; },
 	min: n2('min', Math.min), max: n2('max', Math.max),
 	// comparing
 	'=': (f, a) => ev(f, a[0]) === ev(f, a[1]), '!=': (f, a) => ev(f, a[0]) !== ev(f, a[1]),
@@ -167,7 +184,7 @@ const OPS: Record<string, Op> = {
 		const k = key(f, a[0]), v = ev(f, a[1]);
 		if (typeof v === 'string' && v.length > LIMITS.valueChars) fail('a stored text is at most 256 characters');
 		use(f, GAS.write + k.length + (typeof v === 'string' ? v.length : 0));
-		if (f.world.get(k) === undefined && f.world.entries() >= LIMITS.entries) fail('this contract\'s storage is full');
+		if (f.world.get(k) === undefined && f.world.entries() >= (f.world.maxEntries ?? LIMITS.entries)) fail('this contract\'s storage is full');
 		f.world.set(k, v); return v;
 	},
 	del: (f, a) => { writable(f); use(f, GAS.write); f.world.del(key(f, a[0])); return null; },

@@ -118,6 +118,43 @@ export async function tokenTransferMessage(from: string, to: string, amount: num
 		...(memo ? [memoIx(memo)] : [])
 	], blockhash);
 }
+/** A creator lets one address (the fee account, which collects the creators' fee) take up to `amount` of a token from their
+    token account: SPL ApproveChecked, after making that account if it is missing (the owner pays its small rent). The
+    owner can see it in any Solana wallet and take it back any time (revokeMessage). */
+export async function approveMessage(owner: string, delegate: string, amount: number, blockhash: string, mint: string = USDC_MINT, decimals = 6): Promise<Uint8Array> {
+	if (owner === delegate) throw new Error('That is this account');
+	amountOk(amount);
+	const src = await associatedTokenAccount(owner, mint);
+	return buildMessage(owner, [
+		{ program: ATA_PROGRAM, keys: [{ key: owner, signer: true, writable: true }, { key: src, writable: true }, { key: owner }, { key: mint }, { key: SYSTEM_PROGRAM }, { key: TOKEN_PROGRAM }], data: [1] },
+		{ program: TOKEN_PROGRAM, keys: [{ key: src, writable: true }, { key: mint }, { key: delegate }, { key: owner, signer: true }], data: [13, ...u64(amount), decimals] }, // ApproveChecked
+	], blockhash);
+}
+/** take back a permission given with approveMessage (SPL Revoke) */
+export async function revokeMessage(owner: string, blockhash: string, mint: string = USDC_MINT): Promise<Uint8Array> {
+	const src = await associatedTokenAccount(owner, mint);
+	return buildMessage(owner, [{ program: TOKEN_PROGRAM, keys: [{ key: src, writable: true }, { key: owner, signer: true }], data: [5] }], blockhash);
+}
+/** the permitted address takes `amount` from `owner`'s token account into its own (made if missing, it pays the rent and
+    the fee): SPL TransferChecked signed by the delegate */
+export async function delegatePullMessage(delegate: string, owner: string, amount: number, blockhash: string, memo = '', mint: string = USDC_MINT, decimals = 6): Promise<Uint8Array> {
+	amountOk(amount);
+	const [src, dst] = await Promise.all([associatedTokenAccount(owner, mint), associatedTokenAccount(delegate, mint)]);
+	return buildMessage(delegate, [
+		{ program: ATA_PROGRAM, keys: [{ key: delegate, signer: true, writable: true }, { key: dst, writable: true }, { key: delegate }, { key: mint }, { key: SYSTEM_PROGRAM }, { key: TOKEN_PROGRAM }], data: [1] },
+		{ program: TOKEN_PROGRAM, keys: [{ key: src, writable: true }, { key: mint }, { key: dst, writable: true }, { key: delegate, signer: true }], data: [12, ...u64(amount), decimals] },
+		...(memo ? [memoIx(memo)] : [])
+	], blockhash);
+}
+/** what one token account allows a delegate to take: { delegate, amount } (null when none), from its raw bytes (base64) */
+export function delegationOf(data: string): { delegate: string; amount: number } | null {
+	const b = Uint8Array.from(atob(data), (c) => c.charCodeAt(0));
+	if (b.length < 165) return null;
+	const has = b[72] === 1 && b[73] === 0 && b[74] === 0 && b[75] === 0; // COption<Pubkey> tag
+	if (!has) return null;
+	let amt = 0n; for (let i = 7; i >= 0; i--) amt = (amt << 8n) | BigInt(b[121 + i]);
+	return { delegate: toBase58(hex(b.slice(76, 108))), amount: Number(amt) };
+}
 /** a signed transaction, ready to send: one signature, then the message; base64 */
 export function wire(signature: Uint8Array, message: Uint8Array): string {
 	if (signature.length !== 64) throw new Error('Bad signature');

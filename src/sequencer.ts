@@ -1,4 +1,5 @@
-import { makeBlock, produceBlock, type Block, type Proposed, type Signer } from './block.ts';
+import { choose, fits, makeBlock, together, produceBlock, type Block, type Proposed, type Signer } from './block.ts';
+import { maxTx, roomOf } from './heart.ts';
 import { applyTx, isAddr, nonceOf, RULES, type State, type Tx } from './ledger.ts';
 import { commit, fork, isLayer, parentOf, plain } from './layer.ts';
 
@@ -30,16 +31,20 @@ export class Sequencer {
 	}
 
 	get waiting() { return this.queue.length; }
+	/** the state with everything waiting in it: for reading only */
+	get ahead(): State { return this.pending; }
 	/** the transactions still waiting, oldest first */
 	get waitingTxs(): readonly Tx[] { return this.queue; }
 	/** the last nonce this account has used, counting transactions still waiting for a block */
 	pendingNonce(addr: string) { return nonceOf(this.pending, addr); }
 
 	/** Accept a transaction for a coming block. Returns its id, or throws with the reason. */
-	submit(tx: Tx, now: number = Date.now()): Promise<string> {
+	async submit(tx: Tx, now: number = Date.now()): Promise<string> {
+		await together([tx]); // its signature first, beside others' (outside the line): a bad one is refused below, as before
 		return this.one(async () => {
 			// a full waiting room turns new arrivals away, so nobody can fill a validator's memory or disk
-			if (this.queue.length >= RULES.maxWaiting) throw new Error('This validator is busy. Try again in a moment.');
+			if (this.queue.length >= (this.state.heart ? (tx?.tip ? 20_000 : 15_000) : RULES.maxWaiting)) throw new Error('This validator is busy. Try again in a moment.');
+			if (tx?.type === 'blob.part' && typeof tx.side !== 'string') throw new Error('A file\'s part comes with its bytes (side)');
 			const from = tx && typeof tx === 'object' && isAddr(tx.from) ? tx.from : '';
 			if (from && nonceOf(this.pending, from) - nonceOf(this.state, from) >= RULES.maxWaitingPerSender) throw new Error(`At most ${RULES.maxWaitingPerSender} transactions from one account can wait for a block`);
 			if (!this.queue.length) this.batch = Math.max(Math.floor(now), this.state.time);
@@ -49,9 +54,11 @@ export class Sequencer {
 		});
 	}
 
+	/** what the next block takes from the waiting room: the oldest, as many as fit (by count and by size) */
+	private next() { return this.state.heart ? choose(this.queue, maxTx(this.state), roomOf(this.state)) : this.queue.slice(0, fits(this.queue, maxTx(this.state), roomOf(this.state))); }
 	/** A candidate for the next block, from what is waiting (possibly nothing). Changes nothing here. */
 	propose(now: number = Date.now(), round = 0): Promise<{ block: Proposed; state: State }> {
-		return this.one(() => makeBlock(this.state, this.queue.slice(0, RULES.maxTxPerBlock), this.queue.length ? this.batch : Math.max(Math.floor(now), this.state.time), this.by.address, round));
+		return this.one(() => makeBlock(this.state, this.next(), this.queue.length ? this.batch : Math.max(Math.floor(now), this.state.time), this.by.address, round, !!this.state.heart));
 	}
 
 	/** A block has been decided (ours or another validator's): it becomes the state. Waiting transactions that
@@ -73,12 +80,12 @@ export class Sequencer {
 	/** On a chain with one validator: pack what is waiting into the next block, signed and final. Null when nothing waits
 	    (on a chain with the Sun, an empty block is still made once the clock reaches a new minute: its minutes, and
 	    everything they pay, pass only with a block). */
-	produce(now: number = Date.now()): Promise<Block | null> {
+	produce(now: number = Date.now(), round = 0): Promise<Block | null> {
 		return this.one(async () => {
 			const newMinute = !!this.state.sun && Math.floor(now / 60_000) > this.state.sun.stamp;
 			if (!this.queue.length && !newMinute) return null;
 			const time = this.queue.length ? this.batch : Math.max(Math.floor(now), this.state.time);
-			const { block, state } = await produceBlock(this.state, this.queue.slice(0, RULES.maxTxPerBlock), time, this.by);
+			const { block, state } = await produceBlock(this.state, this.next(), time, this.by, round, !!this.state.heart);
 			await this.move(state, now);
 			return block;
 		});

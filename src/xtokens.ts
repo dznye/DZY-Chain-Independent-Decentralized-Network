@@ -17,8 +17,12 @@ export const USDT: Readonly<Record<string, { address: string; decimals: number }
 	bsc: { address: '0x55d398326f99059ff775485246999027b3197955', decimals: 18 },
 	avax: { address: '0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7', decimals: 6 },
 });
-/** the networks' own coins are counted in billionths on Dznye; the dollar coins in millionths */
-export const CHAIN_DECIMALS: Readonly<Record<string, number>> = Object.freeze({ ETH: 9, POL: 9, BNB: 9, AVAX: 9, USDC: 6, USDT: 6 });
+/** tokenized gold on Ethereum, an ounce each (checked on the chain 2026-11-24: symbol PAXG, 18 decimals; XAUt, 6 decimals) */
+export const GOLD_TOKENS: Readonly<Record<string, Readonly<Record<string, { address: string; decimals: number }>>>> = Object.freeze({
+	eth: Object.freeze({ PAXG: { address: '0x45804880de22913dafe09f4980848ece6ecbaf78', decimals: 18 }, XAUT: { address: '0x68749665ff8d2d112fa859aa293f07a622782f38', decimals: 6 } }),
+});
+/** the networks' own coins are counted in billionths on Dznye; the dollar coins in millionths; PAXG in billionths of an ounce, XAUT in millionths */
+export const CHAIN_DECIMALS: Readonly<Record<string, number>> = Object.freeze({ ETH: 9, POL: 9, BNB: 9, AVAX: 9, USDC: 6, USDT: 6, PAXG: 9, XAUT: 6 });
 
 /** which coin a vault Deposit of `token` on `net` is, and the decimals to drop to count it on Dznye; null: not one the
     exchange takes (it stays in the vault for good) */
@@ -28,6 +32,7 @@ export function evmCoinOf(net: string, token: string): { coin: string; scale: nu
 	if (t === ZERO_TOKEN) return NATIVE[net] ? { coin: NATIVE[net], scale: 18 - CHAIN_DECIMALS[NATIVE[net]] } : null;
 	if (t === c.usdc.toLowerCase()) return { coin: 'USDC', scale: c.usdcDecimals - 6 };
 	if (USDT[net] && t === USDT[net].address) return { coin: 'USDT', scale: USDT[net].decimals - 6 };
+	for (const [coin, g] of Object.entries(GOLD_TOKENS[net] ?? {})) if (t === g.address) return { coin, scale: g.decimals - CHAIN_DECIMALS[coin] };
 	return null;
 }
 /** the token to pay `coin` with on `net` (the zero address: the network's own coin), and its decimals beyond Dznye's */
@@ -37,5 +42,7 @@ export function evmTokenOf(net: string, coin: string): { token: string; decimals
 	if (NATIVE[net] === coin) return { token: ZERO_TOKEN, decimals: 18, scale: 18 - CHAIN_DECIMALS[coin] };
 	if (coin === 'USDC') return { token: c.usdc.toLowerCase(), decimals: c.usdcDecimals, scale: c.usdcDecimals - 6 };
 	if (coin === 'USDT' && USDT[net]) return { token: USDT[net].address, decimals: USDT[net].decimals, scale: USDT[net].decimals - 6 };
+	const g = GOLD_TOKENS[net]?.[coin];
+	if (g) return { token: g.address, decimals: g.decimals, scale: g.decimals - CHAIN_DECIMALS[coin] };
 	return null;
 }

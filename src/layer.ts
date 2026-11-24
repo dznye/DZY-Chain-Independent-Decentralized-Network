@@ -22,9 +22,23 @@ export const COLLECTIONS: [string, string[]][] = [
 	['xpay', ['xpays']], ['xseen', ['xseen']], ['xclaim', ['xclaims']], ['market', ['markets']], ['round', ['rounds']],
 	['owned', ['owned']], ['sale', ['sales']], ['tipbox', ['tipboxes']], // creators (tip, item.buy)
 	['order', ['orders']], ['feeowed', ['feeOwed']], // checkout from any wallet (order.*)
+	['listing', ['listings']], ['resale', ['resales']], // editions resold by their owners (resale.*)
+	['creator', ['creators']], // creators who joined (creator.join), from the checkout upgrade
+	['backed', ['backed']], // the Heart upgrade: when each holder's backing began (heart.ts)
+	['layer', ['layers']], ['lbatch', ['lbatches']], ['ldep', ['ldeps']], // layers (zones.ts)
+	['blob', ['blobs']], ['look', ['looks']], ['col', ['cols']], ['drop', ['drops']], ['dropped', ['dropped']], // files that last, collections and drops (blobs.ts)
+	['xlock', ['xlocks']], ['xloan', ['xloans']], ['xparked', ['xparks']], ['xwait', ['xwaits']], // the Heart upgrade: what was inside `x` (one piece, copied and hashed whole every block)
+	['book', ['books']], ['orderof', ['orderOf']], // the open offers of each pair, and each account's checkouts (ledger.ts), so neither is looked for in all of them
+	['evmacct', ['evmAccts']], ['evmcode', ['evmCodes']], ['evmslot', ['evmSlots']], // Ethereum contracts (evmledger.ts)
 ];
 
 type Obj = Record<string, unknown>;
+/** a deep copy of plain data (what a state holds: objects, lists, text, numbers), several times faster than structuredClone */
+export function copyOf<T>(v: T): T {
+	if (v === null || typeof v !== 'object') return v;
+	if (Array.isArray(v)) { const o = new Array(v.length); for (let i = 0; i < v.length; i++) o[i] = copyOf(v[i]); return o as T; }
+	const o: Obj = {}; for (const k of Object.keys(v)) o[k] = copyOf((v as Obj)[k]); return o as T;
+}
 const TOMB = Symbol('deleted');
 const RAW = Symbol('layer');
 const own = (o: object, k: string) => Object.hasOwn(o, k);
@@ -65,6 +79,18 @@ export function peek(m: Obj, k: string): unknown { const l = layerOf(m); return 
 /** a collection's keys (plain or layer), in a plain object's order, without copying anything */
 export function keysOf(m: Obj): string[] { const l = layerOf(m); return l ? l.keys() : Object.keys(m); }
 
+/* Is a collection empty? Asked after every removal, so it must not list a chain's million entries to find out. A few keys
+   that were there are remembered (a cache: it decides nothing): while one of them is still there, the answer is no. */
+const HINTS = new WeakMap<object, string[]>();
+function someKeys(m: Obj): string[] {
+	const l = layerOf(m);
+	if (l) { if (l.dead) return someKeys(l.dead); const out: string[] = []; for (const [k, v] of l.over) if (v !== TOMB) { out.push(k); if (out.length >= 4) return out; } for (const k of someKeys(l.parent)) if (l.visible(k)) out.push(k); return out; }
+	let h = (HINTS.get(m) ?? []).filter((k) => own(m, k));
+	if (!h.length) { const ks = Object.keys(m); h = ks.length <= 32 ? ks : Array.from({ length: 32 }, () => ks[Math.floor(Math.random() * ks.length)]); HINTS.set(m, h); }
+	return h;
+}
+export function emptyOf(m: object | undefined): boolean { return !m || (!someKeys(m as Obj).length && !keysOf(m as Obj).length); }
+
 function layered(parent: Obj): Obj {
 	const L = new Layer(parent);
 	const write = () => { if (L.dead) throw new Error('this state was already committed: use the state it was committed into'); };
@@ -75,7 +101,7 @@ function layered(parent: Obj): Obj {
 			if (L.dead) return own(L.dead, k) ? L.dead[k] : (Object.prototype as Obj)[k];
 			if (L.over.has(k)) { const v = L.over.get(k); return v === TOMB ? undefined : v; }
 			if (!has(L.parent, k)) return (Object.prototype as Obj)[k]; // like a plain object: its inherited methods
-			const v = peek(L.parent, k), c = v !== null && typeof v === 'object' ? structuredClone(v) : v; // copied the first time it is read
+			const v = peek(L.parent, k), c = v !== null && typeof v === 'object' ? copyOf(v) : v; // copied the first time it is read
 			L.over.set(k, c);
 			return c;
 		},

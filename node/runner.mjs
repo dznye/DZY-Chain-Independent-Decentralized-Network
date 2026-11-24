@@ -52,7 +52,7 @@ const genesisFile = API === 'https://api.dznye.com' && existsSync(new URL('../la
 const node = await startNode({ follow: API, genesisFile, followMs: Number(process.env.FOLLOW_MS) || 20_000, dataDir: join(home, 'data'), port: Number(arg('port') ?? process.env.PORT ?? 8787), host: '127.0.0.1', checker: key });
 say(`Dznye node running. Keep this computer on and online; nothing else to do.`);
 say(`Its address: ${key.address}`);
-if (!process.argv.includes('--no-vaults')) { watchVaults({ api: API, dataDir: home, say: (t) => say('vaults: ' + t) }); say('vault helper on: payments into the exchange vaults are named to the chain from this connection'); }
+if (!process.argv.includes('--no-vaults')) { watchVaults({ api: API, dataDir: home, say: (t) => say('vaults: ' + t), doubt: (id) => client.send(key, 'x.doubt', { id }) }); say('vault helper on: payments into the exchange vaults are named to the chain from this connection'); }
 
 let payTo = null, paidDay = '', warned = 0;
 const payout = arg('payout');

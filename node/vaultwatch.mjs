@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { EVM, rpcOf } from '../src/evm.ts';
-import { eachInTurn, scanEvmVault } from '../src/xwatch.ts';
+import { eachInTurn, paymentThere, scanEvmVault } from '../src/xwatch.ts';
 
 const SPAN = 2_000; // blocks a search: public nodes refuse wider ranges
 const BACK = 5_000; // on a first start, how far back to look
@@ -53,16 +53,31 @@ export async function postPaid(api, net, tx) {
 	return r.ok;
 }
 
+/** The guardian's part: every payment that waits to be counted is looked for on its own chain, from this computer, through
+    two or more different nodes. One that none of them shows is objected to (x.doubt, with this guardian's key), so it is
+    looked at again before it can count. A node that cannot be asked says nothing either way. Returns the ids objected to. */
+export async function guardOnce({ api, me, doubt, rpcsFor = (net) => EVM[net].rpc.map(rpcOf), said = new Set(), say = () => {}, depth }) {
+	const x = await (await fetch(api + '/exchange/waiting', { signal: AbortSignal.timeout(15_000) })).json(), out = [];
+	for (const [id, w] of Object.entries(x.waiting ?? {})) {
+		if (w.by !== undefined || w.block || said.has(id) || !EVM[w.net] || !x.vaults?.[w.net] || x.now > w.until || x.now - w.at < 600_000) continue; // (ten minutes first: this computer's nodes may be a little behind)
+		const answers = await Promise.all(rpcsFor(w.net).slice(0, 5).map(async (rpc) => { try { return await paymentThere(rpc, x.vaults[w.net], w, id.slice(w.net.length + 1), depth); } catch { return null; } }));
+		if (answers.includes(true)) { said.add(id); continue; }
+		if (answers.filter((a) => a === false).length < 2) continue; // not sure: ask again next look
+		try { await doubt(id); said.add(id); out.push(id); say(`objected to a payment of ${w.amount} ${w.coin} that is not on ${EVM[w.net].name}`); } catch (e) { if (/no such|already|too late|guardian/.test(e.message)) said.add(id); }
+	}
+	return out;
+}
+
 /** run it: a look every minute, the place reached kept in `dataDir`/vaultwatch.json so a restart goes on from there */
-export function watchVaults({ api, dataDir, say = console.log, every = 60_000 }) {
+export function watchVaults({ api, dataDir, say = console.log, every = 60_000, doubt = null }) {
 	mkdirSync(dataDir, { recursive: true });
 	const file = join(dataDir, 'vaultwatch.json');
 	let state = {};
 	try { if (existsSync(file)) state = JSON.parse(readFileSync(file, 'utf8')) ?? {}; } catch { state = {}; }
-	let busy = false;
+	let busy = false; const guarded = new Set();
 	const tick = async () => {
 		if (busy) return; busy = true;
-		try { await lookOnce({ api, state, say }); writeFileSync(file, JSON.stringify(state) + '\n'); }
+		try { if (doubt) await guardOnce({ api, doubt, said: guarded, say }).catch(() => {}); await lookOnce({ api, state, say }); writeFileSync(file, JSON.stringify(state) + '\n'); }
 		catch (e) { say(`vault helper: the chain did not answer (${String(e.message ?? e).slice(0, 60)})`); }
 		finally { busy = false; }
 	};

@@ -39,9 +39,9 @@ export class Client {
 
 	/** Sign one transaction with `key` without sending it. `payer` names another account that will pay the fee:
 	    hand the result to that payer to add its signature (`sponsor`), then `submit` it. */
-	async prepare(key: Key, type: string, data: Record<string, unknown>, opts: { payer?: string } = {}): Promise<Tx> {
+	async prepare(key: Key, type: string, data: Record<string, unknown>, opts: { payer?: string; tip?: number; max?: number } = {}): Promise<Tx> {
 		const [info, acct] = await Promise.all([this.info(), this.account(key.address)]);
-		return signTx(key.secret, { chain: info.chain, from: key.address, nonce: acct.nextNonce, type, data, ...(opts.payer ? { payer: opts.payer } : {}) });
+		return signTx(key.secret, { chain: info.chain, from: key.address, nonce: acct.nextNonce, type, data, ...(opts.tip ? { tip: opts.tip } : {}), ...(opts.max ? { max: opts.max } : {}), ...(opts.payer ? { payer: opts.payer } : {}) });
 	}
 	/** As one of several keys an account needs: agree to exactly this transaction. */
 	static async cosign(key: Key, tx: Tx): Promise<Tx> {
@@ -75,11 +75,12 @@ export class Client {
 	}
 
 	/** Sign one transaction with `key` and send it. With `wait` (the default) it returns once the transaction is in a block.
-	    `payer` (a key you also hold) pays the fee instead of `key`. Returns the transaction's id. Throws with the node's
-	    reason when it is refused. */
-	send(key: Key, type: string, data: Record<string, unknown>, wait = true, opts: { payer?: Key } = {}): Promise<string> {
+	    `payer` (a key you also hold) pays the fee instead of `key`. `tip` (shards on top of the fee) goes first while blocks
+	    are full; `max` is the most fee it may cost (above it, it waits): see `GET /fees`. Returns the transaction's id.
+	    Throws with the node's reason when it is refused. */
+	send(key: Key, type: string, data: Record<string, unknown>, wait = true, opts: { payer?: Key; tip?: number; max?: number } = {}): Promise<string> {
 		const job = async () => {
-			let tx = await this.prepare(key, type, data, { payer: opts.payer?.address });
+			let tx = await this.prepare(key, type, data, { payer: opts.payer?.address, tip: opts.tip, max: opts.max });
 			if (opts.payer) tx = await Client.sponsor(opts.payer, tx);
 			return this.submit(tx, wait);
 		};

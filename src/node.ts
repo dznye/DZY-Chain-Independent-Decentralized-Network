@@ -1,7 +1,14 @@
-import { blockHash, checkBlock, fewestSigners, signVote, weights, verifyBlock, voteMessage, type Block, type Proposed, type Signer, type VoteType } from './block.ts';
+import { feeFloor, heartView, maxTx, vouchers } from './heart.ts';
+import { explain } from './plain.ts';
+import { evmAnswer, receiptsOf, keepReceipts, type Receipt } from './evmledger.ts';
+import { isAwake, metadata, usdFor, BLOB } from './blobs.ts';
+import { bare } from './block.ts';
+import { layerRoot } from './zones.ts';
+import { blockHash, checkBlock, fewestSigners, roundOf, signVote, turns, weights, verifyBlock, voteMessage, type Block, type Proposed, type Signer, type VoteType } from './block.ts';
 import { Engine, type Memory, type Step } from './consensus.ts';
 import { canon, sign, solanaAddress, verify } from './crypto.ts';
-import { namesV2On, premiumNameUsd } from './ledger.ts';
+import { namesV2On, premiumNameUsd, indexView } from './ledger.ts';
+import { spotPrice } from './heart.ts';
 import { creditView, economyView, MIN_BUY, openTickets, SUN_BURN, SUN_DOLLARS, sunBuyProblem, sunGenesis, sunMemo, sunPayment, sunSupply, sunView } from './ledger.ts';
 import { depositEvm, depositSol, evmDepositsIn, evmFinalized, evmPaidIn, solDepositSignatures, solPaidIn } from './deposit.ts';
 import type { SunGenesis } from './sun.ts';
@@ -10,12 +17,14 @@ import { rulesJson } from '../v2/rules.mjs';
 import { itemOf, usdCost, xLive, applyTx, nonceOf, loansOf, exchangeOn, exchangeVaults, exchangeVaultFrom, exchangeView, X_COINS, balanceOf, crewFrom, crewOn, genesis, isAddr, isCandidate, NATIVE, RULES, seatPrice, volunteerMessage, streamView, recordOf, recordsOf, spaceRecords, signTx, xMemo, stateRoot, viewContract, type TxReport, supplyOf, type Account, type SignedVote, type State, type Tx, poolQuote, swapPlan, poolAverage, positionHealth, totalVoteWeight, voteWeight, partnerFreeLeft } from './ledger.ts';
 import { Sequencer } from './sequencer.ts';
 import { evmSignerOf, payoutId32, releaseFor, signRelease, signSolRelease, solReleaseFor } from './xrelease.ts';
-import { checkEvmVault, checkSolVault, depositsInTx, eachInTurn, finalBlock, pricesWorthPosting, readChainPrices, solPda, scanEvmVault, scanSolVault, type FoundDeposit } from './xwatch.ts';
+import { checkEvmVault, checkSolVault, depositsInTx, eachInTurn, paymentThere, finalBlock, pricesWorthPosting, readChainPrices, solPda, scanEvmVault, scanSolVault, type FoundDeposit } from './xwatch.ts';
 import { EVM } from './evm.ts';
 import { USDC_MINT } from './solana.ts';
 import { commit, fork, seal } from './layer.ts';
 import { ADAPTERS, confirm, nodeLabel, probeNode, type NodeReport, type Rpc } from './dip.ts';
 import { orderReceived, orderEnough } from './orderpay.ts';
+import { gallery, type Piece } from './gallery.ts';
+import { usdWorth, isParked, lockAt, itemNft, wdzyMint, CREATOR_JOIN_USD, RESALE, resaleFrom, resaleOn } from './ledger.ts';
 /** the public nodes of a chain that answer eth_getLogs over a vault's range (checked 2026-11-19: on BNB Chain publicnode and
     48 Club's; bsc-dataseed.bnbchain.org and bsc-dataseed1.defibit.io refuse it with "limit exceeded", and publicnode also
     refused the live node's calls from Cloudflare, so 48 Club's is there too) */
@@ -52,6 +61,8 @@ export interface Store {
 	/** small named notes that must survive a restart (a validator's own votes) */
 	noteGet(key: string): string | null;
 	noteSet(key: string, value: string): void;
+	/** write a kept block again without the files' bytes it no longer has to keep; optional */
+	rewrite?(block: Block): void;
 }
 /** how a validator reaches the others; only needed on a chain with more than one validator */
 export interface Net {
@@ -68,6 +79,7 @@ export interface NodeConfig {
 	validators?: string[]; // who agrees on blocks (default: the authority alone)
 	fee?: number; // DZY parts every transaction pays, fixed at genesis (default 0: no fee)
 	validator?: Signer; // this node's validator key, when it is a validator
+	blockBytes?: number; // the biggest block this node takes and can store (the Heart upgrade: declared when it checks in)
 	blockMs?: number; // single validator: how long to gather transactions before a block
 	leader?: string; // on a follower: where to send people who want to submit
 	timeouts?: Partial<{ propose: number; vote: number; grow: number; gossip: number; sync: number }>;
@@ -118,7 +130,7 @@ interface VoteMsg { kind: 'vote'; type: VoteType; height: number; round: number;
 type Msg = ProposalMsg | VoteMsg;
 const proposalMessage = (chain: string, height: number, round: number, validRound: number, id: string) => 'dzy-proposal:' + canon({ chain, height, round, validRound, block: id });
 
-const MAX_PEERS = 200, PEER_PER_MINUTE = 10, VIEW_PER_MINUTE = 120, LINKS_FRESH_MS = 5 * 60_000, LINKS_PER_LOOK = 3, MAX_BODY = 20_000, MAX_CONSENSUS_BODY = 2_000_000, TX_PER_MINUTE = 60, RELAY_PER_MINUTE = 600, CONSENSUS_PER_MINUTE = 1200, ROUNDS_AHEAD = 50;
+const MAX_PEERS = 200, PEER_PER_MINUTE = 10, VIEW_PER_MINUTE = 120, LINKS_FRESH_MS = 5 * 60_000, LINKS_PER_LOOK = 3, MAX_BODY = 20_000, MAX_PART_BODY = 135_000, MAX_EVM_BODY = 400_000, EVM_PER_MINUTE = 600, MAX_CONSENSUS_BODY = 10_500_000, TX_PER_MINUTE = 60, RELAY_PER_MINUTE = 600, CONSENSUS_PER_MINUTE = 6000, GET_PER_MINUTE = 1200, ROUNDS_AHEAD = 50;
 const HINT_PER_MINUTE = 10, MAX_HINTS = 1_000, HINT_LIFE = 24 * 3_600_000, SUN_LOOKS = 10; // purchases told to this node: per address a minute, kept at once, kept for, looked at per wake-up
 // personal deposit addresses (deposit.ts) this node watches: asks per address a minute, kept at once, kept for (from the
 // last ask), Ethereum-style chains looked at per minute, blocks per look (halved when a node refuses, regrown after),
@@ -127,6 +139,23 @@ const WATCH_PER_MINUTE = 10, MAX_WATCH = 1_000, WATCH_LIFE = 30 * 24 * 3_600_000
 type Buy = { net: string; token: string; amount: number; tx: string; to: string };
 const isPayId = (net: string, v: unknown): v is string => typeof v === 'string' && (net === 'sol' ? /^[1-9A-HJ-NP-Za-km-z]{32,100}$/.test(v) : /^0x[0-9a-fA-F]{64}$/.test(v));
 
+/** an address inside someone's private network: a node must never be talked into calling one */
+export const privateHost = (host: string) => /^(localhost$|.*\.(localhost|local|internal|lan|home|corp)$|127\.|10\.|192\.168\.|169\.254\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|172\.(1[6-9]|2\d|3[01])\.|0\.|\[?::|\[?f[cd]|\[?fe[89ab])/i.test(host) || /^\d+$/.test(host) || /^0x/i.test(host);
+const publicUrl = (url: string) => { try { return !privateHost(new URL(url).hostname); } catch { return false; } };
+/** Other nodes as this one has found them: one that keeps failing is left alone for a while (longer each time, at most a
+    minute), one that answers is trusted again at once. Nothing a peer says is believed: every block and vote is checked. */
+class PeerBook {
+	private bad = new Map<string, { n: number; until: number }>();
+	ok(p: string) { this.bad.delete(p); }
+	failed(p: string) { const b = this.bad.get(p), n = Math.min(8, (b?.n ?? 0) + 1); if (this.bad.size > 1000) this.bad.clear(); this.bad.set(p, { n, until: Date.now() + Math.min(60_000, 500 * 2 ** n) }); }
+	ready(p: string) { return (this.bad.get(p)?.until ?? 0) <= Date.now(); }
+	/** up to n of these, in random order, the ones that answer first */
+	some(all: string[], n: number): string[] {
+		const mix = [...all]; for (let i = mix.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [mix[i], mix[j]] = [mix[j], mix[i]]; }
+		return [...mix.filter((p) => this.ready(p)), ...mix.filter((p) => !this.ready(p))].slice(0, n);
+	}
+}
+const FANOUT = 24; // how many nodes a message from someone else is passed on to (our own goes to everyone)
 export class NodeCore {
 	broken = ''; // why this node cannot run, if it cannot
 	alert = ''; // on a follower: proof-worthy trouble seen in the history it was shown
@@ -147,6 +176,19 @@ export class NodeCore {
 	private heard = new Map<string, Msg>(); // every valid message of this height (to pass on, and to prove the decision)
 	private mine: Record<string, string | null> = {}; // our own votes this height: "round:kind" → block hash
 	private syncing = false;
+	/* Lists for the web address: what each writer, space, buyer and creator has. Made at most once a block, and only when
+	   asked: a thousand questions about a big chain cost one look through it, not a thousand. */
+	private listsOf: { h: number; last: string; rec?: Map<string, string[]>; own?: Map<string, string[]> } = { h: -1, last: '' };
+	private keysFor(kind: 'rec' | 'own', group: string): string[] {
+		const s = this.state; if (this.listsOf.h !== s.height || this.listsOf.last !== s.last) this.listsOf = { h: s.height, last: s.last };
+		let m = this.listsOf[kind];
+		if (!m) {
+			m = this.listsOf[kind] = new Map(); const put = (g: string, k: string) => { const l = m!.get(g); if (l) l.push(k); else m!.set(g, [k]); };
+			for (const k of Object.keys((kind === 'rec' ? s.records : s.owned) ?? {})) { const a = k.indexOf('/'), b = k.indexOf('/', a + 1); if (kind === 'rec') { put(k.slice(0, b), k); put(k.slice(a, b), k); } else { put(k.slice(0, a), k); put(k.slice(a, b), k); } } // "writer/space" and "/space"; "buyer" and "/creator"
+		}
+		return m.get(group) ?? [];
+	}
+	private galleryOf: { h: number; last: string; list: Piece[] } | null = null; // the last block's gallery (GET /gallery)
 	/** other nodes and archives that hold this chain, as announced to us and checked (the swarm) */
 	private known: string[] = [];
 	private ops = new Map<string, string>(); // volunteer url -> the staked account that vouched for it
@@ -162,8 +204,16 @@ export class NodeCore {
 	/** stopped at the planned height (see haltHeight) */
 	get halted() { const h = this.cfg.haltHeight; return !!h && this.state.height >= h; }
 	/** this node is the only validator: it makes the blocks by itself */
-	private get alone() { const v = this.state.validators; return v.length === 1 && v[0] === this.by?.address; }
-	private get blockMs() { const n = Number(this.cfg.blockMs); return Number.isFinite(n) && n >= 20 && n <= 60_000 ? n : 1000; }
+	private get alone() {
+		const v = this.state.validators, me = this.by?.address;
+		if (v.length === 1) return v[0] === me;
+		// a host that cannot reach other validators (no net) carries on by itself while its own say is more than two thirds:
+		// its signature alone makes a block final, so nothing can contradict it. Otherwise any newcomer joining would stop it.
+		if (this.net || !me || !v.includes(me)) return false;
+		const w = weights(this.state);
+		return (w.power[me] ?? 0) >= w.need;
+	}
+	private get blockMs() { const n = Number(this.cfg.blockMs); return Number.isFinite(n) && n >= 20 && n <= 60_000 ? n : this.state.heart ? 200 : 1000; }
 	private ms(k: 'propose' | 'vote' | 'grow' | 'gossip' | 'sync') { return this.cfg.timeouts?.[k] ?? { propose: 3000, vote: 1000, grow: 500, gossip: 1000, sync: 2000 }[k]; }
 
 	/** one job at a time: a submit, a vote, a block and a sync can never interleave, in memory or on disk */
@@ -275,7 +325,7 @@ export class NodeCore {
 		let host: string;
 		try { host = new URL(clean).hostname; } catch { return 'Give an http(s) address'; }
 		// never let a public node be used to reach into someone's private network
-		if (!this.cfg.allowLocalPeers && /^(localhost|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|0\.|\[?::1\]?$|\[?f[cd])/i.test(host)) return 'That is a private address';
+		if (!this.cfg.allowLocalPeers && privateHost(host)) return 'That is a private address';
 		if (this.peers().includes(clean)) return '';
 		try {
 			const r = await fetch(clean + '/genesis', { signal: AbortSignal.timeout(5000) });
@@ -295,15 +345,65 @@ export class NodeCore {
 	}
 
 	/** keep a snapshot now and then, for new nodes to start from */
+	/** Files' bytes are kept while their file is awake. A block that brought some is remembered; a few are looked at after every
+	    64th block, and the bytes of files that sleep or are gone are dropped (the block checks the same without them). */
+	private keepCargo(block: Block, state: State) {
+		if (!state.heart || !this.store.rewrite) return;
+		const has = block.txs.some((t) => t.side !== undefined);
+		if (!has && block.height % 64) return;
+		let list: number[] = []; try { list = JSON.parse(this.store.noteGet('cargo') ?? '[]'); } catch { /* none */ }
+		if (has) list.push(block.height);
+		if (block.height % 64 === 0) list = [...list.slice(40), ...list.slice(0, 40).filter((h) => this.trim(h, state))];
+		this.store.noteSet('cargo', JSON.stringify(list));
+	}
+	/** drop what block `h` no longer has to keep; whether it still keeps any */
+	trim(h: number, state: State): boolean {
+		const b = this.store.block(h); if (!b) return false;
+		if (b.time > state.time - BLOB.freshMs * 1.5) return true; // a node copying the chain needs a new block's bytes to check it: three days, whatever became of the file
+		let left = false, cut = false;
+		const txs = b.txs.map((t) => { if (t.side === undefined) return t; const x = state.blobs && Object.hasOwn(state.blobs, t.data.id as string) ? state.blobs[t.data.id as string] : null; if (x && isAwake(x, state.time) && x.heights?.[t.data.n as number] === h) { left = true; return t; } cut = true; const { side: _s, ...rest } = t; return rest as Tx; });
+		if (cut) this.store.rewrite!({ ...b, txs });
+		return left;
+	}
+	/** Ethereum-style receipts, for wallets: what each block's contracts did (any node works them out from the block; they
+	    are not part of the state). Found by hash, the newest 50,000 */
+	private evmAt = new Map<string, [number, number]>();
+	private keepReceiptsOf(block: Block) {
+		const list = receiptsOf(block); if (!list.length) return;
+		this.store.noteSet('evm:' + block.height, JSON.stringify(list));
+		list.forEach((r, i) => { this.evmAt.set(r.hash, [block.height, i]); this.store.noteSet('evmtx:' + r.hash, `${block.height}:${i}`); });
+		for (const k of this.evmAt.keys()) { if (this.evmAt.size <= 50_000) break; this.evmAt.delete(k); }
+	}
+	private evmReceipts(h: number): Receipt[] { try { return JSON.parse(this.store.noteGet('evm:' + h) ?? '[]'); } catch { return []; } }
+	/** JSON-RPC, as any Ethereum node answers: MetaMask and Solidity tools connect here */
+	async evm(body: unknown): Promise<unknown> {
+		const hashOf = new Map<number, string>();
+		return evmAnswer({
+			state: () => this.state as never, ...(this.seq ? { pending: () => this.seq!.ahead as never } : {}), now: () => Math.max(Date.now(), this.state.time),
+			block: (h) => { if (h < 1 || h > this.state.height) return null; const b = this.store.block(h); if (!b) return null; const next = h === this.state.height ? this.state.last : hashOf.get(h) ?? this.store.block(h + 1)?.prev ?? ''; hashOf.set(h, next); return { height: h, time: b.time, prev: b.prev, hash: next, receipts: b.txs.some((t) => t.type === 'evm.run') ? this.evmReceipts(h) : [] }; },
+			find: (hash) => { if (!/^[0-9a-f]{64}$/.test(hash)) return null; const m = this.evmAt.get(hash) ?? (this.store.noteGet('evmtx:' + hash) ?? '').split(':').map(Number); return m.length === 2 && Number.isSafeInteger(m[0]) ? { height: m[0], index: m[1] } : null; },
+			send: async (raw, gas) => {
+				if (this.by && this.seq) return this.sendOwn('evm.run', { raw, gas }); // carried by this validator's key, which gets its fee back out of the gas
+				if (!this.cfg.leader) throw new Error('This node cannot carry transactions');
+				const r = await fetch(this.cfg.leader.replace(/\/+$/, '') + '/evm', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: ['0x' + raw] }), signal: AbortSignal.timeout(10_000) }), j = await r.json();
+				if (j?.error) throw new Error(j.error.message); return String(j.result);
+			},
+		}, body);
+	}
 	private keepSnapshot(block: Block, state: State) {
+		this.keepReceiptsOf(block);
+		this.keepCargo(block, state);
 		const every = this.cfg.snapshotEvery ?? 1000;
 		if (every > 0 && block.height % every === 0) this.store.noteSet('snapshot', JSON.stringify({ block, state }));
 	}
 	/** the latest snapshot this node kept, if any */
 	snapshot(): Snapshot | null { try { return JSON.parse(this.store.noteGet('snapshot') ?? 'null'); } catch { return null; } }
 
+	/** called after every block this node takes (server.mjs: the live price stream); nothing else depends on it */
+	onBlock: (() => void) | null = null;
 	/** After every block (and at the start): take the part the current set of validators gives this node. */
 	private async after() {
+		try { this.onBlock?.(); } catch { /* a listener's trouble is never the chain's */ }
 		if (this.halted) { this.engine = null; return; }
 		if (this.alone) {
 			this.engine = null;
@@ -346,12 +446,15 @@ export class NodeCore {
 		const seq = this.seq;
 		await this.one(async () => {
 			if (!this.alone || this.halted) return;
-			const block = await seq.produce(Date.now());
+			const round = roundOf(seq.state, seq.state.height + 1, this.by!.address); // 0 with one validator; else the first that is its turn
+			const block = round < 0 ? null : await seq.produce(Date.now(), round);
 			if (!block) return;
-			try { this.store.commit(block, seq.state, block.txs.length); } catch (e) {
+			const part = !!seq.state.heart; // the Heart upgrade's block may leave some waiting out: what still waits is kept by name, below
+			try { this.store.commit(block, seq.state, part ? 0 : block.txs.length); } catch (e) {
 				this.broken = 'Could not store a block'; // memory must never run ahead of what is stored
 				throw e;
 			}
+			if (part) { const still = new Set(seq.waitingTxs.map((t) => t.from + ':' + t.nonce)); for (const row of this.store.queueList()) if (!still.has(row.tx.from + ':' + row.tx.nonce)) this.store.queueDrop(row.seq); }
 			this.keepSnapshot(block, seq.state);
 			await this.after(); // the block may have changed who the validators are
 		});
@@ -375,7 +478,7 @@ export class NodeCore {
 			vote: (type, round, id) => { this.go(async () => { if (live()) await this.sendVote(eng, type, round, id); }); },
 			timeout: (step: Step, round) => this.net!.timer((step === 'propose' ? this.ms('propose') : this.ms('vote')) + round * this.ms('grow'), () => { this.go(async () => { if (live()) eng.onTimeout(step, round); }); }),
 			decide: (id, round) => { this.go(async () => { if (live()) await this.decided(id, round); }); }
-		}, mem?.memory, weights(this.state).power);
+		}, mem?.memory, weights(this.state).power, turns(this.state, h));
 		for (const [k, id] of Object.entries(this.mine)) { const [r, type] = k.split(':'); eng.recall(type as VoteType, Number(r), id); }
 		this.engine = eng;
 	}
@@ -390,7 +493,9 @@ export class NodeCore {
 		for (const m of this.heard.values()) this.spread(m);
 	}
 	private keyOf(m: Msg) { return m.kind === 'proposal' ? `p|${m.round}|${m.from}|${m.sig}` : `v|${m.type}|${m.round}|${m.from}|${m.block}`; }
-	private spread(m: Msg) { for (const p of this.net!.peers) this.net!.post(p, '/consensus', { msg: m }); }
+	private book = new PeerBook();
+	/** our own message to every node; someone else's to FANOUT of them at random (each passes it on too, so all hear it) */
+	private spread(m: Msg) { const all = this.net!.peers, mine = m.from === this.by?.address; for (const p of mine || all.length <= FANOUT ? all : this.book.some(all, FANOUT)) this.net!.post(p, '/consensus', { msg: m }); }
 
 	private async sendProposal(eng: Engine, round: number, id: string | null, validRound: number) {
 		let c = id ? this.cands.get(id) : undefined;
@@ -420,7 +525,8 @@ export class NodeCore {
 		const sigs = [...this.heard.values()].filter((m): m is VoteMsg => m.kind === 'vote' && m.type === 'precommit' && m.round === round && m.block === id).map((m) => ({ validator: m.from, sig: m.sig }));
 		const w = weights(this.state);
 		if (sigs.reduce((n, x) => n + (w.power[x.validator] ?? 0), 0) < w.need) return; // we cannot prove it ourselves: take the block, with its proof, from a peer
-		await this.finish({ ...c.block, commit: { round, sigs } }, c.next);
+		const whole = { ...c.block, commit: { round, sigs } }; keepReceipts(whole, c.next);
+		await this.finish(whole, c.next);
 	}
 	private async finish(block: Block, next: State) {
 		next = commit(next); // the block's layer written into the live state (layer.ts)
@@ -738,6 +844,15 @@ export class NodeCore {
 				if (ok) this.xPaid.delete(k);
 			} catch (e) { this.xStatus.error = { at: now, what: `${h.net} payment ${h.tx.slice(0, 10)}…: ${(e as Error).message}` }; }
 		}
+		// payments that wait for anyone to object: counted when their time is over; one that was objected to is read again
+		// here, from every node this validator has, and thrown out if none of them shows it (only an anchor may)
+		for (const [id, w] of Object.entries(s.xwaits ?? {})) {
+			if (s.time > w.until && now > w.until + 2_000) { if (!this.xSent.has('count:' + id)) { this.xSent.add('count:' + id); await send('x.count', { id }).catch(() => this.xSent.delete('count:' + id)); } continue; }
+			if (w.by === undefined || !vouchers(s).includes(by.address) || this.xSent.has('drop:' + id) || !EVM[w.net]) continue;
+			const vault = exchangeVaults(s)[w.net]; if (!vault) continue;
+			const said = await Promise.all(this.nodesOf(w.net).map(async (n) => { try { return await paymentThere(n.rpc, vault, w, id.slice(w.net.length + 1), this.cfg.xFinalDepth); } catch { return null; } }));
+			if (said.filter((x) => x === false).length >= 2 && !said.includes(true)) { this.xSent.add('drop:' + id); await send('x.drop', { id }).catch(() => this.xSent.delete('drop:' + id)); }
+		}
 		for (const [net, vault] of Object.entries(exchangeVaults(s))) {
 			// reading a vault's deposits needs eth_getLogs, which some public nodes refuse ("limit exceeded" on every BNB
 			// Chain dataseed): only the nodes known to answer it, when any of them is in this validator's list
@@ -747,7 +862,7 @@ export class NodeCore {
 			try {
 				let found: { deposits: FoundDeposit[]; released: { id32: string; tx: string }[] }, cursor: number | string | undefined;
 				if (net === 'sol') {
-					const r = await scanSolVault(node.rpc, vault, USDC_MINT, this.xCursor.get(net) as string | undefined);
+					const r = await scanSolVault(node.rpc, vault, USDC_MINT, this.xCursor.get(net) as string | undefined, 50, 10, wdzyMint(s.chain));
 					found = r; cursor = r.next;
 				} else {
 					const c = EVM[net];
@@ -785,10 +900,12 @@ export class NodeCore {
 		if (n && this.state.time - n.at < RULES.checkinWindowMs / 3) return;
 		this.checkinLook = now;
 		// it quotes the newest block it holds; without a public address it is a checker only (never drawn to make blocks)
-		const s = this.state, data = { seen: [s.height, s.last], ...(this.cfg.selfUrl ? { url: this.cfg.selfUrl } : {}) };
+		const s = this.state, data = { seen: [s.height, s.last], ...(this.cfg.selfUrl ? { url: this.cfg.selfUrl } : {}), ...(s.heart && this.cfg.blockBytes ? { big: this.cfg.blockBytes } : {}) };
 		const tx = await signTx(by.secret, { chain: this.first.chain, from: by.address, nonce: seq.pendingNonce(by.address) + 1, type: 'node.checkin', data });
 		await this.one(() => this.accept(tx));
 	}
+	/** a transaction of this validator's own (the host asks: files it keeps) */
+	async sendOwn(type: string, data: Record<string, unknown>): Promise<string> { const by = this.by!, seq = this.seq!; return this.one(async () => this.accept(await signTx(by.secret, { chain: this.first.chain, from: by.address, nonce: seq.pendingNonce(by.address) + 1, type, data }))); }
 	/** checkers: a follower given a staked key (its `checker`) says a few times an hour which block it checked last, by
 	    a transaction the caller sends to the node it follows. It gives no public address: a follower makes no blocks.
 	    Nothing while it has seen trouble (an alert): it only vouches for a chain it has checked. */
@@ -804,7 +921,7 @@ export class NodeCore {
 		if (!this.net || !this.state.nodes) return;
 		this.basePeers ??= [...this.net.peers];
 		const nodes = this.state.nodes, me = this.by?.address;
-		const urls = this.state.validators.filter((v) => v !== me && Object.hasOwn(nodes, v) && nodes[v].url).map((v) => nodes[v].url!);
+		const urls = this.state.validators.filter((v) => v !== me && Object.hasOwn(nodes, v) && nodes[v].url).map((v) => nodes[v].url!).filter((u) => this.cfg.allowLocalPeers || publicUrl(u)); // written on the chain by anyone with 1 DZY staked: never a way into someone's private network
 		this.net.peers = [...new Set([...this.basePeers, ...urls])];
 	}
 	private async postBtc(by: Signer, seq: Sequencer) {
@@ -902,14 +1019,23 @@ export class NodeCore {
 		if (this.syncing || !this.net?.peers.length) return;
 		this.syncing = true;
 		try {
-			const peer = this.net.peers[Math.floor(Math.random() * this.net.peers.length)];
-			const info = await this.net.get(peer, '/');
-			if (!(Number(info?.height) > this.state.height)) return;
-			const page = await this.net.get(peer, `/blocks?from=${this.state.height + 1}&limit=50`);
-			for (const b of (Array.isArray(page?.blocks) ? page.blocks : []) as Block[]) {
-				await this.one(async () => { if (!this.stopped && !this.halted && b?.height === this.state.height + 1) await this.finish(b, await verifyBlock(this.seq!.state, b, Date.now())); });
+			const asked = this.book.some(this.net.peers, 3);
+			const heights = await Promise.all(asked.map(async (p) => { try { const h = Number((await this.net!.get(p, '/'))?.height); this.book.ok(p); return Number.isSafeInteger(h) ? h : 0; } catch { this.book.failed(p); return 0; } }));
+			for (const [peer, high] of asked.map((p, i): [string, number] => [p, heights[i]]).sort((x, y) => y[1] - x[1])) {
+				if (!(high > this.state.height)) return;
+				try {
+					for (let pages = 0; pages < 20 && high > this.state.height && !this.stopped; pages++) {
+						const was = this.state.height, page = await this.net.get(peer, `/blocks?from=${was + 1}&limit=50`);
+						for (const b of (Array.isArray(page?.blocks) ? page.blocks : []) as Block[]) {
+							await this.one(async () => { if (!this.stopped && !this.halted && b?.height === this.state.height + 1) await this.finish(b, await verifyBlock(this.seq!.state, b, Date.now())); });
+						}
+						if (this.state.height === was) break;
+					}
+					if (this.state.height >= high) return;
+				} catch { /* unreachable, or it sent a block that breaks the rules: the next one */ }
+				this.book.failed(peer);
 			}
-		} catch { /* that peer is unreachable or sent something wrong: try another next time */ } finally { this.syncing = false; }
+		} catch { /* nobody answered: again soon */ } finally { this.syncing = false; }
 	}
 
 	/* ------------------------------ followers ------------------------------ */
@@ -958,7 +1084,7 @@ export class NodeCore {
 
 	private allow(key: string, max = TX_PER_MINUTE) {
 		const t = Date.now(), h = this.hits.get(key);
-		if (this.hits.size > 5000) this.hits.clear();
+		if (this.hits.size > 20_000) { for (const [k, v] of this.hits) if (v.reset < t) this.hits.delete(k); for (const k of this.hits.keys()) { if (this.hits.size <= 20_000) break; this.hits.delete(k); } } // old ones first: a crowd of addresses can never wipe everyone's count
 		if (!h || h.reset < t) { this.hits.set(key, { n: 1, reset: t + 60_000 }); return true; }
 		return ++h.n <= max;
 	}
@@ -967,6 +1093,32 @@ export class NodeCore {
 		const path = req.path.replace(/\/+$/, '') || '/', s = this.state;
 
 		if (req.method === 'GET') {
+			if (req.ip !== 'local' && !this.allow('g:' + req.ip, GET_PER_MINUTE)) return { status: 429, body: { error: 'Slow down a little' } };
+			if (path === '/heart') return { status: 200, body: heartView(s) };
+			const nf = path.match(/^\/nft\/(n[0-9a-f]{16})(?:\.json)?$/);
+			if (nf) { const md = metadata(s as unknown as Parameters<typeof metadata>[0], nf[1], (this.cfg.selfUrl ?? '').replace(/\/+$/, '')); return md ? { status: 200, body: md } : { status: 404, body: { error: 'No such NFT' } }; }
+			// what it costs now, as a taxi would say it: slow (waits for the quietest fee), normal, fast (goes first while blocks are full)
+			if (path === '/fees') { const waits = this.seq?.waiting ?? 0, room = maxTx(s), busy = waits > room, fee = s.fee ?? 0, usd = (n: number) => usdWorth(s, NATIVE, n) ?? null; return { status: 200, body: { fee, usd: usd(fee), waiting: waits, perBlock: room, busy, slow: { max: s.heart ? feeFloor(s) * 2 : fee }, normal: { fee, usd: usd(fee) }, fast: busy ? { tip: fee * 2, usd: usd(fee * 3) } : { tip: 0, usd: usd(fee) } } }; }
+			const lk = path.match(/^\/look\/([0-9a-f]{64})$/);
+			if (lk) return s.looks && Object.hasOwn(s.looks, lk[1]) ? { status: 200, body: s.looks[lk[1]] } : { status: 404, body: { error: 'It has no look' } };
+			const bi = path.match(/^\/blobinfo\/([0-9a-f]{64})(?:\/(\d{1,2}))?$/);
+			if (bi) {
+				const b = s.blobs && Object.hasOwn(s.blobs, bi[1]) ? s.blobs[bi[1]] : null;
+				if (!b) return { status: 404, body: { error: 'No such file' } };
+				if (bi[2] === undefined) return { status: 200, body: { id: bi[1], ...b } };
+				const h = b.heights?.[Number(bi[2])], tx = h === undefined ? null : this.store.block(h)?.txs.find((t) => t.type === 'blob.part' && t.data.id === bi[1] && t.data.n === Number(bi[2])); // a part, out of its block: any host can rebuild a small file
+				return tx?.side ? { status: 200, body: { height: h, n: Number(bi[2]), b: tx.side } } : { status: 404, body: { error: 'This node does not keep that part' } };
+			}
+			if (path === '/blobprice') { const n = Math.min(512_000_000, Math.max(1, Math.floor(Number(req.query.get('bytes'))) || 1)), y = Math.min(BLOB.maxYears, Math.max(1, Math.floor(Number(req.query.get('years'))) || 1)), c = (k: 'in' | 'out') => ({ usd: usdFor(k, n, y), dzy: usdCost(s, NATIVE, usdFor(k, n, y)) }); return { status: 200, body: { bytes: n, years: y, held: BLOB.bond, in: c('in'), out: c('out') } }; }
+			if (path === '/layers') return { status: 200, body: Object.fromEntries(Object.entries(s.layers ?? {}).slice(-500).map(([id, l]) => [id, { name: l.name, kind: l.kind, asset: l.asset, by: l.by, held: l.held, bond: l.bond, posted: l.posted, counts: l.fin, wait: l.wait, dead: l.dead ?? null }])) };
+			const ly = path.match(/^\/layer\/(l[0-9a-f]{16})(?:\/(\d{1,12}))?$/);
+			if (ly) {
+				const l = s.layers && Object.hasOwn(s.layers, ly[1]) ? s.layers[ly[1]] : null;
+				if (!l) return { status: 404, body: { error: 'No such layer' } };
+				if (!ly[2]) return { status: 200, body: { id: ly[1], ...l, root: layerRoot(s, ly[1], Math.max(s.time, Date.now())) } };
+				const b = s.lbatches && Object.hasOwn(s.lbatches, ly[1] + '/' + ly[2]) ? s.lbatches[ly[1] + '/' + ly[2]] : null, dp = s.ldeps && Object.hasOwn(s.ldeps, ly[1] + '/' + ly[2]) ? s.ldeps[ly[1] + '/' + ly[2]] : null;
+				return { status: 200, body: { batch: b, deposit: dp } };
+			}
 			if (path === '/') return { status: 200, body: { name: 'Dznye', chain: s.chain, coin: NATIVE, authority: s.authority, validators: s.validators, needed: fewestSigners(s), power: ((w) => ({ total: w.total, needed: w.need }))(weights(s)), staked: !!s.staked, fee: s.fee ?? 0, height: s.height, last: s.last, time: s.time, snapshot: ((n) => (n ? { height: n.block.height, hash: n.state.last } : undefined))(this.snapshot()), role: this.halted ? 'halted' : this.seq ? (this.alone ? 'leader' : this.engine ? 'validator' : 'standby') : 'follower', haltHeight: this.cfg.haltHeight || undefined, waiting: this.seq?.waiting ?? 0, alert: this.alert || undefined, leader: this.seq ? undefined : this.cfg.leader, sun: s.sun ? true : undefined, operator: this.cfg.operator } };
 			// on a chain with the Sun, the genesis settings travel with it, so a follower can build the very same first state
 			if (path === '/genesis') return { status: 200, body: this.cfg.sun ? { ...this.first, sunGenesis: this.cfg.sun } : this.first };
@@ -1015,18 +1167,34 @@ export class NodeCore {
 			const sp = path.match(/^\/shop\/([0-9a-f]{64})$/);
 			if (sp) return s.shops && Object.hasOwn(s.shops, sp[1]) ? { status: 200, body: { shop: sp[1], ...s.shops[sp[1]], freeLeft: partnerFreeLeft(s, sp[1], now), partner: partnerFreeLeft(s, sp[1], now) > 0 || (s.shops[sp[1]].reserve.DZY ?? 0) >= RULES.partnerMinReserve } } : { status: 404, body: { error: 'This account has no cashback set' } };
 			// creators: what a buyer owns (one item, or the latest 100), an item's sales, a creator's tip box
+			const by = path.match(/^\/buyers\/([0-9a-f]{64})$/); // a creator's latest buyers: who owns what, newest first
+			if (by) return { status: 200, body: { buyers: this.keysFor('own', '/' + by[1]).filter((k) => !!s.owned && Object.hasOwn(s.owned, k)).map((k): [string, NonNullable<State['owned']>[string]] => [k, s.owned![k]]).map(([k, v]) => { const [buyer, , item] = k.split('/'); return { buyer, item, at: v.at, ...(v.ed ? { ed: v.ed } : {}), ...(v.usd ? { usd: v.usd } : {}), ...(v.until ? { until: v.until } : {}) }; }).sort((a, b) => b.at - a.at).slice(0, 20) } };
 			const ow = path.match(/^\/owned\/([0-9a-f]{64})(?:\/([0-9a-f]{64})\/([A-Za-z0-9._:-]{1,64}))?$/);
 			if (ow) {
 				if (ow[2]) {
 					const k = `${ow[1]}/${ow[2]}/${ow[3]}`, o = s.owned && Object.hasOwn(s.owned, k) ? s.owned[k] : null;
 					if (o && o.until !== undefined && o.until < now) return { status: 404, body: { error: 'The membership has ended: renew it', until: o.until } };
-					return o ? { status: 200, body: { buyer: ow[1], seller: ow[2], item: ow[3], ...o } } : { status: 404, body: { error: 'Not owned' } };
+					// a card is owned by whoever holds it, however they got it, and by nobody who has let it go
+					const rec = s.records && Object.hasOwn(s.records, `${ow[2]}/items/${ow[3]}`) ? s.records[`${ow[2]}/items/${ow[3]}`] : null, card = itemNft(s, rec?.value, s.height), holds = !!card && ow[1] !== ow[2] && balanceOf(s, ow[1], card) >= 1;
+					if (card && !holds) return { status: 404, body: { error: o ? 'The card was given or sold to someone else' : 'Not owned' } };
+					if (o) return { status: 200, body: { buyer: ow[1], seller: ow[2], item: ow[3], ...o } };
+					return holds ? { status: 200, body: { buyer: ow[1], seller: ow[2], item: ow[3], at: s.time, asset: card, paid: 0, card } } : { status: 404, body: { error: 'Not owned' } };
 				}
-				const items = Object.entries(s.owned ?? {}).filter(([k]) => k.startsWith(ow[1] + '/')).map(([k, v]) => { const [, seller, item] = k.split('/'); return { seller, item, ...v }; }).sort((a, b) => b.at - a.at).slice(0, 100);
+				const items = this.keysFor('own', ow[1]).filter((k) => !!s.owned && Object.hasOwn(s.owned, k)).map((k): [string, NonNullable<State['owned']>[string]] => [k, s.owned![k]]).map(([k, v]) => { const [, seller, item] = k.split('/'); return { seller, item, ...v }; }).sort((a, b) => b.at - a.at).slice(0, 100);
 				return { status: 200, body: { items } };
 			}
+			// a business's orders and bookings (ledger.ts BIZ), newest first; and how full each slot of an offer is
+			const bz = path.match(/^\/biz\/([0-9a-f]{64})$/);
+			if (bz) return { status: 200, body: { entries: [...(s.biz?.[bz[1]] ?? [])].reverse() } };
+			const sz = path.match(/^\/slots\/([0-9a-f]{64})\/([A-Za-z0-9._:-]{1,64})$/);
+			if (sz) { const p = `${sz[1]}/${sz[2]}/`; return { status: 200, body: { taken: Object.fromEntries(Object.entries(s.slots ?? {}).filter(([k]) => k.startsWith(p)).map(([k, n]) => [k.slice(p.length), n])) } }; }
 			const sl = path.match(/^\/sales\/([0-9a-f]{64})\/([A-Za-z0-9._:-]{1,64})$/);
 			if (sl) { const k = `${sl[1]}/${sl[2]}`; return { status: 200, body: s.sales && Object.hasOwn(s.sales, k) ? s.sales[k] : { n: 0, total: 0 } }; }
+			// Allyra: every piece shown or sold (gallery.ts), made again only when a new block came
+			if (path === '/gallery') {
+				if (this.galleryOf?.h !== s.height || this.galleryOf.last !== s.last) this.galleryOf = { h: s.height, last: s.last, list: gallery(s, now, true) };
+				return { status: 200, body: { resale: { open: resaleOn(s), from: resaleFrom(s.chain), ...RESALE }, pieces: this.galleryOf.list.filter((p) => !p.held || req.query.get('all') === '1') } };
+			}
 			// what a dollar-priced item (or any dollar amount: /usd?usd=) costs in each coin the chain prices, now
 			const iq = path.match(/^\/itemquote\/([0-9a-f]{64})\/([A-Za-z0-9._:-]{1,64})$/);
 			if (iq || path === '/usd') {
@@ -1042,8 +1210,9 @@ export class NodeCore {
 			if (od) return s.orders && Object.hasOwn(s.orders, od[1]) ? { status: 200, body: { id: od[1], ...s.orders[od[1]] } } : { status: 404, body: { error: 'No such checkout (done, or ended)' } };
 			const ob = path.match(/^\/orders\/([0-9a-f]{64})$/);
 			if (ob) return { status: 200, body: { orders: Object.entries(s.orders ?? {}).filter(([, o]) => o.buyer === ob[1] || o.seller === ob[1]).map(([id, o]) => ({ id, ...o })) } };
+			if (path === '/feeowed') return { status: 200, body: s.feeOwed ?? {} }; // every creator's tab (the network's fee account collects them)
 			const fo = path.match(/^\/feeowed\/([0-9a-f]{64})$/);
-			if (fo) return { status: 200, body: { usd: s.feeOwed?.[fo[1]] ?? 0 } };
+			if (fo) return { status: 200, body: { usd: s.feeOwed?.[fo[1]] ?? 0, ...(s.joinDue?.[fo[1]] !== undefined ? { join: { usd: CREATOR_JOIN_USD, due: s.joinDue[fo[1]] } } : {}) } }; // and a shop's $5, with when its free days end
 			const tb = path.match(/^\/tips\/([0-9a-f]{64})$/);
 			if (tb) return { status: 200, body: s.tipboxes && Object.hasOwn(s.tipboxes, tb[1]) ? s.tipboxes[tb[1]] : { total: {}, n: 0, last: [] } };
 			// tasks sites pay for: all open ones (without who has done them), or one in full
@@ -1054,9 +1223,9 @@ export class NodeCore {
 			const rm = path.match(/^\/record\/([0-9a-f]{64})\/([a-z0-9][a-z0-9-]{0,31})\/([A-Za-z0-9._:-]{1,64})$/);
 			if (rm) { const r = recordOf(s, rm[1], rm[2], rm[3]); return r ? { status: 200, body: r } : { status: 404, body: { error: 'No such record' } }; }
 			const rl = path.match(/^\/records\/([0-9a-f]{64})\/([a-z0-9][a-z0-9-]{0,31})$/);
-			if (rl) return { status: 200, body: { records: recordsOf(s, rl[1], rl[2], Math.min(100, Number(req.query.get('limit')) || 100), req.query.get('after') ?? '') } };
+			if (rl) return { status: 200, body: { records: recordsOf(s, rl[1], rl[2], Math.min(100, Number(req.query.get('limit')) || 100), req.query.get('after') ?? '', this.keysFor('rec', `${rl[1]}/${rl[2]}`)) } };
 			const rs = path.match(/^\/space\/([a-z0-9][a-z0-9-]{0,31})$/);
-			if (rs) return { status: 200, body: { records: spaceRecords(s, rs[1], Math.min(100, Number(req.query.get('limit')) || 100), Number(req.query.get('before')) || Infinity) } };
+			if (rs) return { status: 200, body: { records: spaceRecords(s, rs[1], Math.min(100, Number(req.query.get('limit')) || 100), Number(req.query.get('before')) || Infinity, this.keysFor('rec', '/' + rs[1])) } };
 			// a stream, as it stands now: what is owed to the receiver, what is left to flow
 			const sm = path.match(/^\/stream\/(s[0-9a-f]{16})$/);
 			if (sm) { const v = streamView(s, sm[1], Math.max(Date.now(), s.time)); return v ? { status: 200, body: v } : { status: 404, body: { error: 'No such stream (never opened, finished or stopped)' } }; }
@@ -1110,6 +1279,8 @@ export class NodeCore {
 			const chan = path.match(/^\/channel\/(ch[0-9a-f]{16})$/);
 			if (chan) return s.channels && Object.hasOwn(s.channels, chan[1]) ? { status: 200, body: { id: chan[1], ...s.channels[chan[1]] } } : { status: 404, body: { error: 'No such channel (never opened, or settled)' } };
 			// the exchange: whether it is open, its coins and limits, what every vault holds against the claims on it, the agreed prices, and the latest payouts
+			// DZY's price and nothing else (a few bytes): what a live chart asks often, instead of all of /exchange
+			if (path === '/price') { const i = indexView(s); return { status: 200, body: { price: s.sun ? spotPrice(s) : null, index: i.on, reserveUsd: i.reserveUsd, unbacked: i.unbacked, height: s.height, time: s.time } }; }
 			if (path === '/exchange') return { status: 200, body: { ...exchangeView(s), watcher: this.by ? this.xStatus : undefined } };
 			// a validator's part in paying a sell-back from an Ethereum-style vault: its signer address, and its signature on a
 			// real, unpaid payout to a listed vault (anyone collects them from more than two thirds of the validators and submits)
@@ -1128,7 +1299,8 @@ export class NodeCore {
 				return { status: 200, body: { ...r, amount: r.amount.toString(), signer, sig } };
 			}
 			const xa = path.match(/^\/exchange\/([0-9a-f]{64})$/);
-			if (xa) return { status: 200, body: { claims: Object.fromEntries(Object.keys(X_COINS).map((c) => [c, balanceOf(s, xa[1], 'x' + c)])), locks: Object.fromEntries(Object.keys(X_COINS).map((c) => [c, s.x?.locks?.[xa[1] + ':' + c] ?? 0])), parked: !!s.x?.park?.[xa[1]], loans: loansOf(s, xa[1], Math.max(Date.now(), s.time)), dusd: balanceOf(s, xa[1], 'DUSD'), payouts: Object.entries(s.xpays ?? {}).filter(([, p]) => p.by === xa[1]).slice(-50).map(([id, p]) => ({ id, ...p })) } };
+			if (xa) return { status: 200, body: { claims: Object.fromEntries(Object.keys(X_COINS).map((c) => [c, balanceOf(s, xa[1], 'x' + c)])), locks: Object.fromEntries(Object.keys(X_COINS).map((c) => [c, lockAt(s, xa[1] + ':' + c)])), parked: isParked(s, xa[1]), loans: loansOf(s, xa[1], Math.max(Date.now(), s.time)), dusd: balanceOf(s, xa[1], 'DUSD'), payouts: Object.entries(s.xpays ?? {}).filter(([, p]) => p.by === xa[1]).slice(-50).map(([id, p]) => ({ id, ...p })) } };
+			if (path === '/exchange/waiting') return { status: 200, body: { now: s.time, vaults: exchangeVaults(s), waiting: s.xwaits ?? {} } };
 			if (path === '/nodes') return { status: 200, body: { crewFrom: Number.isFinite(crewFrom(s.chain)) ? crewFrom(s.chain) : null, nodes: s.nodes ?? {}, crew: s.crew ?? null } }; // the crew upgrade: who checked in, and the crew
 			if (path === '/validators') return { status: 200, body: { validators: s.validators, needed: fewestSigners(s), power: weights(s).power, totalPower: weights(s).total, neededPower: weights(s).need, staked: !!s.staked, minStake: RULES.minStake, seatPrice: seatPrice(s), unbondDays: RULES.unbondDelay / 86_400_000, stakes: s.stakes ?? {}, delegations: s.delegations ?? {}, undelegating: s.undelegating ?? {} } };
 			// treasury payouts proposed by stakers, with the votes so far and what passing needs
@@ -1136,18 +1308,33 @@ export class NodeCore {
 			const acct = path.match(/^\/account\/([0-9a-f]{64})$/);
 			if (acct) {
 				const a: Account = Object.hasOwn(s.accounts, acct[1]) ? s.accounts[acct[1]] : { nonce: 0, bal: {} };
-				return { status: 200, body: { address: acct[1], balances: a.bal, nonce: a.nonce, nextNonce: (this.seq ? this.seq.pendingNonce(acct[1]) : a.nonce) + 1, keys: a.keys ?? [], firstKeyOff: !!a.off, agents: a.agents ?? {}, guardian: a.guardian ?? null, recover: a.recover ?? null, name: a.name ?? null, solana: solanaAddress(acct[1]), links: a.links ?? {}, multi: a.multi ?? null, stake: s.stakes && Object.hasOwn(s.stakes, acct[1]) ? s.stakes[acct[1]] : null } };
+				return { status: 200, body: { address: acct[1], balances: a.bal, nonce: a.nonce, nextNonce: (this.seq ? this.seq.pendingNonce(acct[1]) : a.nonce) + 1, keys: a.keys ?? [], firstKeyOff: !!a.off, agents: a.agents ?? {}, guardian: a.guardian ?? null, recover: a.recover ?? null, name: a.name ?? null, solana: solanaAddress(acct[1]), links: a.links ?? {}, multi: a.multi ?? null, hashKey: a.q ?? null, stake: s.stakes && Object.hasOwn(s.stakes, acct[1]) ? s.stakes[acct[1]] : null } };
 			}
 			const one = path.match(/^\/block\/(\d{1,15})$/);
 			if (one) { const b = this.store.block(Number(one[1])); return b ? { status: 200, body: b } : { status: 404, body: { error: 'No such block' } }; }
 			if (path === '/blocks') {
 				const from = Math.max(1, Math.floor(Number(req.query.get('from'))) || 1), limit = Math.min(100, Math.max(1, Math.floor(Number(req.query.get('limit'))) || 50));
-				return { status: 200, body: { height: s.height, blocks: this.store.blocks(from, limit) } };
+				const out: Block[] = []; let size = 0;
+				for (const b of this.store.blocks(from, limit)) { const x = b.time < Date.now() - BLOB.freshMs ? bare(b) : b; size += b.txs.length ? JSON.stringify(x).length : 300; if (out.length && size > 8_000_000) break; out.push(x); } // old files' bytes only on request (/blobinfo); never more than a few megabytes at once
+				return { status: 200, body: { height: s.height, blocks: out } };
 			}
 			return { status: 404, body: { error: 'Not found' } };
 		}
 
 		if (req.method !== 'POST') return { status: 405, body: { error: 'Not allowed' } };
+		// what an action does, in plain words, and what it costs, in dollars; nothing is signed or sent
+		if (path === '/explain') {
+			if (!this.allow('v:' + req.ip, VIEW_PER_MINUTE)) return { status: 429, body: { error: 'Slow down a little' } };
+			if (req.body.length > MAX_PART_BODY) return { status: 413, body: { error: 'Too big' } };
+			try { const m = JSON.parse(req.body) as { from?: unknown; type?: unknown; data?: unknown }; return { status: 200, body: { ...explain(s, { from: typeof m.from === 'string' ? m.from : '', type: String(m.type ?? ''), data: m.data && typeof m.data === 'object' && !Array.isArray(m.data) ? m.data as Record<string, unknown> : {} }, Math.max(Date.now(), s.time)) } }; } catch { return { status: 400, body: { error: 'Send { from, type, data }' } }; }
+		}
+		if (path === '/evm') {
+			if (!s.heart) return { status: 404, body: { error: 'Ethereum contracts start with the Heart upgrade' } };
+			if (req.body.length > MAX_EVM_BODY) return { status: 413, body: { error: 'Too big' } };
+			let m: unknown; try { m = JSON.parse(req.body); } catch { return { status: 400, body: { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'bad JSON' } } }; }
+			for (let i = 0; i < Math.min(20, Array.isArray(m) ? m.length : 1); i++) if (!this.allow('e:' + req.ip, EVM_PER_MINUTE)) return { status: 429, body: { jsonrpc: '2.0', id: null, error: { code: -32005, message: 'Slow down a little' } } }; // every question counts, also those in a list
+			return { status: 200, body: await this.evm(m) as Record<string, unknown> };
+		}
 		// any node, a follower too, takes announcements of other places that hold the chain
 		// try a signed transaction against a copy of the chain: what would happen, and what it would cost. Nothing changes.
 		if (path === '/simulate') {
@@ -1251,7 +1438,7 @@ export class NodeCore {
 			return { status: 200, body: { ok: true } };
 		}
 		if (!this.seq) return { status: 405, body: { error: 'This node only follows and checks. Send transactions to a validator.', leader: this.cfg.leader } };
-		if (req.body.length > (path === '/consensus' ? MAX_CONSENSUS_BODY : MAX_BODY)) return { status: 413, body: { error: 'Too big' } };
+		if (req.body.length > (path === '/consensus' ? (s.heart ? MAX_CONSENSUS_BODY : 2_000_000) : s.heart ? MAX_PART_BODY : MAX_BODY)) return { status: 413, body: { error: 'Too big' } };
 		// limits come before any work is done on what was sent. "relayed" (passed on by another validator) is only a hint,
 		// and anyone can claim it: it gets a larger allowance, never none
 		const ip = req.ip || 'unknown', relayed = req.query.get('relay') === '1';

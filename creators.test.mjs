@@ -259,7 +259,7 @@ await test('names: 4 letters or more as before; 1 to 3 letters are premium, from
 		assert.deepEqual(s.premiumSold, { 1: 2, 2: 1, 3: 1 });
 		await refused(s, C, 'name.set', { name: 'ace' }, /taken/);
 		await refused(s, C, 'name.set', { name: 'q' }, /premium name: \$15/); // C cannot pay $15
-		await refused(s, C, 'name.grant', { name: 'cc', to: C.address }, /only the founder/);
+		await refused(s, C, 'name.grant', { name: 'cc', to: C.address }, /only the fee account/);
 		whole(s, 'premium names');
 		return `@z $5, @y $10; next 1-letter $15, 2-letter $7.50, 3-letter $6.25`;
 	} finally { L.testNamesV2From(CHAIN, null); }

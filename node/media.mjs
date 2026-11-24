@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const POINTER = /^\/media\/([0-9a-f]{64})\/([0-9a-f]{32})$/;
-const MAX = 400_000, PER_ROUND = 40;
+const MAX = 1_500_000, PER_ROUND = 40; // public pictures only (site/media.ts MEDIA_MAX); a bigger one is left to the site
 const TYPES = [['image/webp', (b) => b.length > 12 && b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP'], ['image/jpeg', (b) => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff], ['image/png', (b) => b.length > 8 && b[0] === 0x89 && b.toString('latin1', 1, 4) === 'PNG']];
 export const typeOf = (b) => TYPES.find(([, ok]) => ok(b))?.[0] ?? null;
 export const fingerprintOk = (bytes, id) => createHash('sha256').update(bytes).digest('hex').slice(0, 32) === id;
@@ -36,8 +36,8 @@ export function mediaKeeper({ dir, sources, fetchFn = fetch }) {
 	async function copy(addr, id) {
 		for (const src of sources()) {
 			try {
-				const r = await fetchFn(`${src.replace(/\/+$/, '')}/media/${addr}/${id}`, { signal: AbortSignal.timeout(8000) });
-				if (!r.ok) continue;
+				const r = await fetchFn(`${src.replace(/\/+$/, '')}/media/${addr}/${id}`, { signal: AbortSignal.timeout(15_000) });
+				if (!r.ok || Number(r.headers.get('content-length') ?? 0) > MAX) continue;
 				const b = Buffer.from(await r.arrayBuffer());
 				if (b.length > MAX || !typeOf(b) || !fingerprintOk(b, id)) continue; // a wrong or changed picture: try the next source
 				mkdirSync(join(dir, addr), { recursive: true });

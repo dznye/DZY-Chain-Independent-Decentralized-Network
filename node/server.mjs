@@ -24,7 +24,15 @@
 // --follow takes several sources, comma-separated: nodes (http addresses) and archives (folders, or addresses ending in
 // /index.json; see chain/archive.mjs). It copies from all of them, checks everything, and finds more through /peers.
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
+import { lendSha256 } from '../src/crypto.ts';
 import { mediaKeeper } from './media.mjs';
+import { blobKeeper } from './blobs.mjs';
+import { decoderPool } from './evmpool.mjs';
+import { fingerprint, sealed } from '../launch/seal.mjs';
+import { lendDecoder } from '../src/evmledger.ts';
+import { fileKeeper } from './files.mjs';
+import { RULES } from '../src/ledger.ts';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -67,6 +75,7 @@ function openStore(dataDir) {
 		queueDrop(seq) { db.prepare('DELETE FROM mempool WHERE seq = ?').run(seq); },
 		block(height) { const r = db.prepare('SELECT json FROM blocks WHERE height = ?').get(height); return r ? JSON.parse(r.json) : null; },
 		blocks(from, limit) { return db.prepare('SELECT json FROM blocks WHERE height >= ? ORDER BY height LIMIT ?').all(from, limit).map((r) => JSON.parse(r.json)); },
+		rewrite(block) { db.prepare('UPDATE blocks SET json = ? WHERE height = ?').run(JSON.stringify(block), block.height); },
 		noteGet(key) { return meta('note:' + key); },
 		noteSet(key, value) { db.prepare('INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)').run('note:' + key, value); }
 	};
@@ -96,7 +105,10 @@ function sourceOf(where) {
     validators + peers (the other validators' URLs): be one of several validators.
     snapshotFrom + trust: an empty node starts from that node's latest snapshot instead of block 1, if the snapshot's
       block has exactly the hash `trust` (get it from several nodes' GET /). snapshotEvery: how often to keep one. */
-export async function startNode({ dataDir = null, port = 8787, host = '127.0.0.1', sun, chain, authority, blockMs, follow, followMs = 2000, validators, validator, checker, peers = [], timeouts, fee, snapshotEvery, snapshotFrom, trust, genesisFile, haltHeight, publicUrl, operator, allowLocalPeers, solana, solanaRpc, evm, evmRpc, btc, btcRpc, btcTestFloor, priceRead, xFinalDepth, watchMs = 5000, mediaFrom = 'https://wallet.dznye.com', mediaMs = 10 * 60_000 } = {}) {
+const SEAL = { seal: fingerprint().seal, sealed: sealed()?.seal ?? null };
+const pool = decoderPool(); lendDecoder((raws, chainId) => pool.decode(raws, chainId));
+await lendSha256((s) => createHash('sha256').update(s, 'utf8').digest('hex'));
+export async function startNode({ dataDir = null, port = 8787, host = '127.0.0.1', sun, chain, authority, blockMs, blockBytes = 8_000_000, blobMb = 0, blobRefuse = null, follow, followMs = 2000, validators, validator, checker, peers = [], timeouts, fee, snapshotEvery, snapshotFrom, trust, genesisFile, haltHeight, publicUrl, operator, allowLocalPeers, solana, solanaRpc, evm, evmRpc, btc, btcRpc, btcTestFloor, priceRead, xFinalDepth, watchMs = 5000, mediaFrom = 'https://wallet.dznye.com', mediaMs = 10 * 60_000 } = {}) {
 	const sources = String(follow ?? '').split(',').map((s) => s.trim()).filter(Boolean).map(sourceOf);
 	const firstNode = sources.find((s) => !s.archive)?.where;
 	if (genesisFile) { // one file every operator of a chain shares: the chain is exactly this, or the node does not start
@@ -133,10 +145,15 @@ export async function startNode({ dataDir = null, port = 8787, host = '127.0.0.1
 		if (!pinned) setMeta('follows', JSON.stringify({ chain, authority, validators, fee }));
 	}
 	let timer = null, timerAt = 0, loop = null, stopped = false;
-	const timers = new Set();
+	const timers = new Set(), inFlight = new Map();
 	const net = { // how this validator reaches the others
 		peers: peers.map((p) => p.replace(/\/+$/, '')),
-		post(peer, path, body) { if (!stopped) fetch(peer + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(4000) }).then((r) => r.arrayBuffer()).catch(() => {}); },
+		post(peer, path, body) { // at most 64 messages on their way to one node: a slow or dead one never piles up memory here
+			const n = inFlight.get(peer) ?? 0;
+			if (stopped || n >= 64) return;
+			inFlight.set(peer, n + 1);
+			fetch(peer + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), redirect: 'error', signal: AbortSignal.timeout(4000) }).then((r) => r.arrayBuffer()).catch(() => {}).finally(() => { const left = (inFlight.get(peer) ?? 1) - 1; if (left > 0) inFlight.set(peer, left); else inFlight.delete(peer); });
+		},
 		get: (peer, path) => getJson(peer)(path),
 		timer(ms, run) { if (stopped) return; const t = setTimeout(() => { timers.delete(t); if (!stopped) run(); }, ms); timers.add(t); }
 	};
@@ -154,7 +171,7 @@ export async function startNode({ dataDir = null, port = 8787, host = '127.0.0.1
 		if (!trust) { db.close(); throw new Error('Starting from a snapshot needs the hash of its block to trust (TRUST_HASH)'); }
 		try { snapshot = { ...(await getJson(snapshotFrom)('/snapshot')), trust }; } catch (e) { db.close(); throw new Error('Could not fetch the snapshot: ' + e.message); }
 	}
-	const core = new NodeCore({ sun, chain, authority, blockMs, leader: firstNode, validators, validator, checker: follow ? checker : undefined, timeouts, fee, snapshotEvery, snapshot, haltHeight, selfUrl: publicUrl, operator, allowLocalPeers, solana, solanaRpc, evm, evmRpc, btc, btcRpc, btcTestFloor, priceRead, xFinalDepth }, store, wake, net);
+	const core = new NodeCore({ sun, chain, authority, blockMs, blockBytes, leader: firstNode, validators, validator, checker: follow ? checker : undefined, timeouts, fee, snapshotEvery, snapshot, haltHeight, selfUrl: publicUrl, operator, allowLocalPeers, solana, solanaRpc, evm, evmRpc, btc, btcRpc, btcTestFloor, priceRead, xFinalDepth }, store, wake, net);
 	await core.start();
 	if (core.broken) { db.close(); throw new Error(core.broken); }
 
@@ -162,12 +179,36 @@ export async function startNode({ dataDir = null, port = 8787, host = '127.0.0.1
 	   from other nodes first and the wallet's site last, each checked against its fingerprint. */
 	const mediaSources = () => [...(sources ?? []).filter((x) => !x.archive).map((x) => x.where), ...(mediaFrom ? [mediaFrom] : [])];
 	const media = dataDir ? mediaKeeper({ dir: join(dataDir, 'media'), sources: mediaSources }) : null;
+	/* Files that last (blobs.mjs): small ones rebuilt from this node's blocks; pieces of big ones kept up to blobMb megabytes */
+	const blobs = blobKeeper({ dir: dataDir && blobMb ? join(dataDir, 'blobs') : null, budget: blobMb * 1_000_000, refuseFile: blobRefuse, state: () => core.state, block: (h) => store.block(h), sources: () => [...new Set([...net.peers, ...core.peers().filter((u) => u !== publicUrl)])] });
+	// creators' files, encrypted (files.mjs): only where the owner gives them room (FILES_MB, 0 by default)
+	const fileRoom = Math.max(0, Math.floor(Number(process.env.FILES_MB ?? 0) || 0)) * 1_000_000;
+	const files = dataDir ? fileKeeper({ dir: join(dataDir, 'files'), budget: fileRoom, sources: mediaSources, founder: RULES.saleFeeTo }) : null;
+	/* the live price stream's listeners: told after a block only when DZY's price moved 0.1% or more since the last word */
+	const listeners = new Set(), MAX_LISTENERS = 5_000; let lastSaid = null;
+	const priceNow = async () => (await core.handle({ method: 'GET', path: '/price', query: new URLSearchParams(), body: '', auth: '', ip: 'self' })).body;
+	core.onBlock = () => {
+		if (!listeners.size) return; // nobody listening: nothing to work out
+		priceNow().then((p) => {
+			if (!p?.price || (lastSaid && Math.abs(p.price - lastSaid) * 1000 < lastSaid)) return; // under 0.1%: nothing to say
+			lastSaid = p.price; const line = `data: ${JSON.stringify(p)}\n\n`;
+			for (const res of listeners) { try { res.write(line); } catch { listeners.delete(res); } }
+		}).catch(() => {});
+	};
+	const keepAlive = setInterval(() => { for (const res of listeners) { try { res.write(': still here\n\n'); } catch { listeners.delete(res); } } }, 50_000); keepAlive.unref?.();
 	const server = createServer(async (req, res) => {
 		try {
+			if (req.method === 'GET' && req.url === '/seal') { res.writeHead(200, HEADERS).end(JSON.stringify({ ...SEAL })); return; } // which rules this node runs (launch/seal.mjs)
+			if (req.url?.startsWith('/blob/') && (req.method === 'GET' || req.method === 'POST')) {
+				const list = []; let n = 0; if (req.method === 'POST') for await (const c of req) { n += c.length; if (n > 66_000_000) break; list.push(c); }
+				const r = n > 66_000_000 ? { status: 413, text: 'Too big' } : await blobs.handle(req.method, new URL(req.url, 'http://n').pathname, Buffer.concat(list), req.headers.range);
+				if (r) { res.writeHead(r.status, r.head ?? { ...HEADERS, 'content-type': 'text/plain' }).end(r.bytes ? Buffer.from(r.bytes.buffer, r.bytes.byteOffset, r.bytes.length) : r.text); return; }
+			}
 			if (req.method === 'OPTIONS') { res.writeHead(204, HEADERS).end(); return; }
 			let body = '';
-			const cap = (req.url ?? '').startsWith('/consensus') ? 2_100_000 : 24_000; // a proposal carries a whole block; a deploy carries a program
+			const cap = (req.url ?? '').startsWith('/consensus') ? 10_600_000 : (req.url ?? '').startsWith('/evm') ? 420_000 : 140_000; // a proposal carries a whole block; a deploy carries a program
 			if (req.method === 'POST') for await (const chunk of req) { body += chunk; if (body.length > cap) break; }
+			if (body.length > cap) { res.writeHead(413, { ...HEADERS, connection: 'close' }).end(JSON.stringify({ error: 'Too big' })); return; } // (the rest of it is not read)
 			const url = new URL(req.url ?? '/', 'http://node');
 			// creators' pictures this node keeps (media.mjs): served at the same address the chain's records use
 			if (req.method === 'GET' && url.pathname.startsWith('/media/') && media) {
@@ -175,10 +216,26 @@ export async function startNode({ dataDir = null, port = 8787, host = '127.0.0.1
 				if (m) { res.writeHead(200, { ...HEADERS, 'content-type': m.type, 'cache-control': 'public, max-age=31536000, immutable', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'" }).end(m.body); return; }
 				res.writeHead(404, HEADERS).end(JSON.stringify({ error: 'This node does not keep that picture' })); return;
 			}
+			if (req.method === 'GET' && url.pathname.startsWith('/file/') && files) {
+				const m = files.serve(url.pathname);
+				if (m) { res.writeHead(200, { ...HEADERS, 'content-type': m.type, 'cache-control': 'public, max-age=86400', 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'" }).end(m.body); return; }
+				res.writeHead(404, HEADERS).end(JSON.stringify({ error: 'This node does not keep that file' })); return;
+			}
+			// the live price (GET /price/stream): the connection stays open and hears DZY's price only when a block moved it
+			// 0.1% or more (a buy, a sell, a coin in the reserve moving); while nothing moves, nothing is sent but a few
+			// bytes every 50 seconds so the line is not dropped. The wallet uses it only when switched on (exchange.js)
+			if (req.method === 'GET' && url.pathname === '/price/stream') {
+				if (listeners.size >= MAX_LISTENERS) { res.writeHead(503, HEADERS).end(JSON.stringify({ error: 'Too many listening: ask GET /price instead' })); return; }
+				res.writeHead(200, { ...HEADERS, 'content-type': 'text/event-stream', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' });
+				const now = await priceNow(); if (lastSaid === null && now?.price) lastSaid = now.price; // the price just told is the one to move from
+				res.write(`data: ${JSON.stringify(now)}\n\n`); listeners.add(res); req.on('close', () => listeners.delete(res)); return;
+			}
 			const out = await core.handle({ method: req.method ?? 'GET', path: url.pathname, query: url.searchParams, body, auth: req.headers.authorization ?? '', ip: req.socket.remoteAddress ?? 'unknown' });
 			res.writeHead(out.status, HEADERS).end(JSON.stringify(out.body));
-		} catch (e) { res.writeHead(500, HEADERS).end(JSON.stringify({ error: 'The node hit an error' })); console.error(e); }
+		} catch (e) { if (e?.code === 'ECONNRESET' || req.destroyed || res.headersSent) { res.destroy(); return; } res.writeHead(500, HEADERS).end(JSON.stringify({ error: 'The node hit an error' })); console.error(e); } // (a caller that hung up is nobody's error: not a line in the log)
 	});
+	// slow or endless requests, and crowds of open connections, cannot tie this node up
+	server.headersTimeout = 10_000; server.requestTimeout = 20_000; server.keepAliveTimeout = 5_000; server.maxConnections = 2_000; server.maxHeadersCount = 64;
 	await new Promise((ok, bad) => server.once('error', bad).listen(port, host, ok));
 
 	/* Following a swarm: every round, copy from every source (a lying one raises an alert; a dead one is skipped), then
@@ -186,13 +243,22 @@ export async function startNode({ dataDir = null, port = 8787, host = '127.0.0.1
 	   public address tells the others about itself, so the swarm grows by itself. */
 	const known = new Set(sources.map((s) => s.where));
 	const swarm = sources.length > 1;
-	let announced = false;
+	let announced = false, round = 0, peersAsked = 0;
+	const LIGHT = followMs >= 10_000, PEERS_EVERY = LIGHT ? 30 * 60_000 : 0, QUIET_MS = 100_000; // LIGHT: a home node (runner.mjs), which need not be there the same second
 	async function sync() {
 		let added = 0, reached = 0;
-		for (const s of [...sources]) {
+		// other nodes first, in a new order each time; the first source (the live node, on Cloudflare) only now and then, when
+		// the others are behind, or when there are no others: a thousand nodes keep each other up to date, not a thousand times it
+		const rest = sources.slice(1).filter((s) => !s.archive).sort(() => Math.random() - 0.5), fresh = () => Date.now() - core.state.time < QUIET_MS;
+		const list0 = LIGHT && rest.length ? [...sources.filter((s) => s.archive && !fresh()), ...rest.slice(0, 4), ...(sources[0] && !sources[0].archive ? [sources[0]] : [])] : [...sources];
+		round++;
+		for (const s of list0) {
+			if (LIGHT && s === sources[0] && !s.archive && rest.length && reached >= 2 && fresh() && round % 15 !== 1) break;
 			try { added += await core.follow(s.get, { behindOk: swarm || s.archive, label: s.archive ? 'archive ' + s.where : s.where }); reached++; } catch { /* unreachable: try the others */ }
 		}
 		if (!reached && sources.length) throw new Error('No source answered');
+		if (Date.now() - peersAsked < PEERS_EVERY && !(publicUrl && !announced)) return added; // who else there is changes slowly
+		peersAsked = Date.now();
 		for (const s of sources.filter((x) => !x.archive)) {
 			if (publicUrl && !announced) fetch(s.where + '/peers', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: publicUrl }), signal: AbortSignal.timeout(5000) }).catch(() => {});
 			if (sources.length >= MAX_SOURCES) continue;
@@ -220,23 +286,32 @@ export async function startNode({ dataDir = null, port = 8787, host = '127.0.0.1
 					if (!r.ok) console.error('Check-in refused:', (await r.json().catch(() => ({}))).error ?? r.status);
 				}
 			} catch (e) { console.error('Check-in not sent:', e.message); }
-			if (!stopped) loop = setTimeout(again, followMs);
+			// a block comes about once a minute when nothing happens: a follower that has the newest waits for the next one
+			const since = Date.now() - core.state.time, wait = LIGHT && round > 5 && since >= 0 && since < 50_000 ? Math.max(followMs, 58_000 - since + Math.random() * 8_000) : followMs;
+			if (!stopped) loop = setTimeout(again, wait);
 		};
 		again();
 	}
 	// a validator looks on Solana for payments of cross-chain offers every few seconds (when it has a Solana node to ask)
 	const watcher = validator ? setInterval(() => { core.watch().catch(() => {}); }, watchMs) : null;
+	// files: copy a piece too few keep, and show once a chain day the ones this validator keeps
+	const blobRound = async () => {
+		if (stopped || !blobMb) return;
+		try { await blobs.round(); if (validator && core.seq) for (const data of blobs.proofs(validator.address)) await core.sendOwn('blob.prove', data); } catch { /* next time */ }
+	};
+	const blobTimer = blobMb ? setInterval(blobRound, Math.max(2_000, watchMs * 12)) : null;
 	// the pictures: a first round a little after start, then every mediaMs (gentle: at most 40 new pictures a round)
-	const mediaRound = () => { if (!stopped && media) media.round(core.state).then((n) => { if (n) console.log(`Kept ${n} more creator picture${n > 1 ? 's' : ''}`); }).catch(() => {}); };
+	const mediaRound = () => { if (!stopped && media) media.round(core.state).then((n) => { if (n) console.log(`Kept ${n} more creator picture${n > 1 ? 's' : ''}`); }).catch(() => {}); if (!stopped && files) files.round(core.state).then((n) => { if (n) console.log('Kept one more creator file (encrypted)'); }).catch(() => {}); };
 	const mediaFirst = media && mediaMs > 0 ? setTimeout(mediaRound, 30_000) : null, mediaTimer = media && mediaMs > 0 ? setInterval(mediaRound, mediaMs) : null;
 	async function stop() {
 		if (stopped) return; stopped = true;
 		core.stop();
-		clearTimeout(timer); clearTimeout(loop); clearInterval(watcher); clearTimeout(mediaFirst); clearInterval(mediaTimer); for (const t of timers) clearTimeout(t);
+		clearTimeout(timer); clearTimeout(loop); clearInterval(watcher); clearInterval(blobTimer); clearTimeout(mediaFirst); clearInterval(mediaTimer); for (const t of timers) clearTimeout(t);
+		clearInterval(keepAlive); for (const res of listeners) { try { res.end(); } catch { /* gone */ } } listeners.clear(); // the live price stream
 		await new Promise((ok) => { server.close(ok); server.closeAllConnections(); });
 		try { db.close(); } catch { /* already closed */ }
 	}
-	return { url: `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${server.address().port}`, core, sync, stop, net, port: server.address().port, sources: () => sources.map((s) => s.where), media };
+	return { url: `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${server.address().port}`, core, sync, stop, net, port: server.address().port, sources: () => sources.map((s) => s.where), media, blobs, blobRound };
 }
 
 // run from the command line
