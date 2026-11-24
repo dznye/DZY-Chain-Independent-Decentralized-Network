@@ -1,6 +1,6 @@
 # DZY Chain
 
-**An independent blockchain anyone can run from a laptop.** Payments are final in seconds and cost a tiny fraction of a cent. Names, tokens, creator payments and swaps with other chains are built in. Open to everyone: install a node and you're part of the network.
+**An independent blockchain anyone can run from a laptop.** Payments are final in under a second and cost a tiny fraction of a cent. Names, tokens, creator payments and swaps with other chains are built in. Open to everyone: install a node and you're part of the network.
 
 ## Start in one line
 
@@ -25,8 +25,8 @@ The node makes its own key, copies the chain and checks every block. Send it 1 D
 | | Bitcoin | Ethereum | Solana | **DZY** |
 |---|---|---|---|---|
 | Run a full node | Hundreds of GB, a day or more to sync | Over 1 TB, specialised setup | Data-centre hardware | **Any laptop, synced in minutes** |
-| Payment final | About an hour | About 13 minutes | Seconds | **Seconds, never reversed** |
-| Typical fee | Cents to dollars | Cents to dollars | A fraction of a cent | **Under a millionth of a cent** |
+| Payment final | About an hour | About 13 minutes | Seconds | **Under a second (one block), never reversed** |
+| Typical fee | Cents to dollars | Cents to dollars | A fraction of a cent | **About $0.00002** |
 | Names (@you) | No | Separate service | Separate service | **Built in** |
 | Your own token | No | Write and audit a contract | Deploy a program | **One transaction** |
 | Sell to fans, tips, editions | Apps on top | Apps on top | Apps on top | **Built in** |
